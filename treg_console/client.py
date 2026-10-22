@@ -133,7 +133,7 @@ class TregClient:
     def _get(self, path: str, params: dict | None = None) -> object:
         r = self._http.get(path, params=params)
         if r.status_code >= 400:
-            raise TregError(self._error_text(r), status=r.status_code, body=_safe_json(r))
+            raise TregError(_error_text(r), status=r.status_code, body=_safe_json(r))
         try:
             return r.json()
         except ValueError:

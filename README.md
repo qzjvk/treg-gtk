@@ -2,16 +2,16 @@
 
 A native Linux desktop app (GTK3) that uses [treg](https://treg.to) as its
 backend. The simple path is the **Browse** tab: search the web, click a
-result, and read the page. Under the hood it's a full console — an X
-(Twitter) frontend, a 4,000+ endpoint catalog, live calls with cost, and the
-team's call audit log.
+result, and read the page. Under the hood it's a full console — X (Twitter)
+and Reddit frontends, a 4,000+ endpoint catalog, live calls with cost, and
+the team's call audit log.
 
 ## The goal
 
 The treg console is meant to become the **everything app** — one native
 window that is your gateway to the internet: search the web and read pages,
-summarize anything with a local model, browse social platforms (X today,
-more as treg's catalog grows), and call any of treg's 4,000+ endpoints — all
+summarize anything with a local model, browse social platforms (X and Reddit
+today, more as treg's catalog grows), and call any of treg's 4,000+ endpoints — all
 with live cost, without leaving the desktop. treg's catalog (113 platforms,
 new providers all the time) is the backend that makes this possible: every
 platform or service treg can reach is a frontend this app can add next.
@@ -117,6 +117,16 @@ treg-console --no-desktop           # start without touching it
   **Replies** loads the thread, **Profile** loads the author's profile.
   Posts come from treg's routed `x.*` endpoints — each view costs a fraction
   of a cent, and the charge shows in the status bar.
+- **Reddit** — a Reddit frontend. Three modes: **Search** (a keyword or
+  phrase), **Subreddit** (a subreddit's posts — `r/` optional) and **User**
+  (a user's posts — `u/` optional). Select a post for its full text, media
+  image, stats and a link out to Reddit; **Comments** loads the comment tree
+  (replies nested with ↳ arrows), **Profile** loads the user's profile.
+  The post view renders from the feed row at once, then a detail call
+  enriches it (Markdown body, media, flair); if that call misses, the feed
+  data stays on screen. Posts come from treg-routed Reddit endpoints —
+  each view costs a fraction of a cent, and the charge shows in the status
+  bar.
 
 ## Credentials
 

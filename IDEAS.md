@@ -7,6 +7,7 @@ catalog already has coverage it's noted; the rest is to build.
 
 - **Reddit** — a frontend tab like the X tab: search, subreddit timelines,
   post detail + comments. treg already has a Reddit platform (50 endpoints).
+  *Done — the Reddit tab is in the app (see README).*
 - **Markets & financial data** — quotes, prices, fundamentals, sorted and
   laid out. treg has a Stock Market Data platform (57 endpoints) and Crypto
   Market Data (14). **yfinance** as a direct data source where the catalog

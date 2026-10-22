@@ -19,6 +19,8 @@ Tabs:
   X        — an X (Twitter) frontend: search posts, browse an account's
              timeline, read a post with its media and replies, profiles,
              and trending topics
+  Reddit   — a Reddit frontend: search posts, browse a subreddit's or a
+             user's posts, read a post with its media, and its comment tree
 
 Credentials come from the treg CLI config (~/.treg/config.json) or TREG_TOKEN.
 """
@@ -119,7 +121,7 @@ def _count(v) -> str:
     return str(v)
 
 
-def _x_fetch_image(url: str) -> bytes | None:
+def _fetch_image(url: str) -> bytes | None:
     """Fetch one media image off the GUI thread (None on any failure)."""
     try:
         r = httpx.get(url, timeout=20.0, follow_redirects=True)
@@ -127,6 +129,146 @@ def _x_fetch_image(url: str) -> bytes | None:
         return r.content
     except httpx.HTTPError:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Reddit tab helpers
+# ---------------------------------------------------------------------------
+
+def _reddit_norm_post(p: dict) -> dict:
+    """Normalize one Reddit post row to the tab's fixed shape. Two native
+    shapes exist: the app's SubredditPost objects (postTitle, content,
+    authorInfo) and scrapecreators' flat rows (title, selftext, author)."""
+    def first(*keys):
+        for k in keys:
+            v = p.get(k)
+            if v is not None:
+                return v
+        return None
+    pid = str(first("name", "id") or "")
+    if pid and not pid.startswith("t3_"):
+        pid = f"t3_{pid}"  # the tikhub endpoints need the fullname
+    author = first("author")
+    if not author:
+        author = ((p.get("authorInfo") or {}).get("name")) or ""
+    sub = p.get("subreddit")
+    if isinstance(sub, dict):
+        sub = sub.get("prefixedName") or sub.get("name") or ""
+    else:
+        sub = sub or ""
+    if sub and not sub.startswith("r/"):
+        sub = f"r/{sub}"
+    flair = p.get("flair")
+    flair = flair.get("text") if isinstance(flair, dict) else p.get("link_flair_text")
+    permalink = first("permalink")
+    url = first("url") or (f"https://www.reddit.com{permalink}" if permalink else "")
+    return {
+        "id": pid,
+        "title": first("title", "postTitle") or "",
+        "body": first("selftext") or ((p.get("content") or {}).get("markdown")) or "",
+        "author": author,
+        "subreddit": sub,
+        "created": first("created_utc", "createdAt"),
+        "score": first("score") or 0,
+        "comments": first("num_comments", "commentCount") or 0,
+        "url": url or "",
+        "flair": flair or "",
+        "self_post": bool(first("isSelfPost")) or str(first("domain") or "").startswith("self."),
+        "image": _reddit_post_image(p),
+    }
+
+
+def _reddit_when(created) -> str:
+    if created is None:
+        return ""
+    if isinstance(created, (int, float)) and not isinstance(created, bool):
+        return time.strftime("%Y-%m-%d %H:%M", time.gmtime(created))
+    m = re.match(r"(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})", str(created))
+    return f"{m.group(1)} {m.group(2)}" if m else str(created)
+
+
+def _reddit_post_image(p: dict) -> str | None:
+    """First image URL of a post: the media still, a gallery image, or the
+    thumbnail. Self (text) posts have no image."""
+    if p.get("isSelfPost"):
+        return None
+    m = p.get("media")
+    if isinstance(m, dict):
+        still = (m.get("still") or {}).get("source")
+        if isinstance(still, dict) and still.get("url"):
+            return still["url"]
+        images = m.get("images")
+        if isinstance(images, list) and images and isinstance(images[0], dict):
+            src = (images[0].get("source") or {}).get("url")
+            if src:
+                return src
+    t = p.get("thumbnail")
+    if isinstance(t, dict) and t.get("url"):
+        return t["url"]
+    if isinstance(t, str) and t:
+        return t
+    return None
+
+
+def _reddit_posts_of(body: object) -> list[dict]:
+    """Extract post rows from the three Reddit response shapes:
+    scrapecreators' flat `posts`, the dynamic search's edge/children posts,
+    and the user feed's edge nodes."""
+    if not isinstance(body, dict):
+        return []
+    if isinstance(body.get("posts"), list):
+        return [p for p in body["posts"] if isinstance(p, dict)]
+    data = body.get("data")
+    if not isinstance(data, dict):
+        return []
+    posts: list[dict] = []
+    search = data.get("search")
+    main = (((search or {}).get("dynamic") or {}).get("components") or {}).get("main") or {}
+    for edge in main.get("edges") or []:
+        if not isinstance(edge, dict):
+            continue
+        node = edge.get("node") or {}
+        children = node.get("children") if isinstance(node, dict) else None
+        for child in children if children is not None else (edge.get("children") or []):
+            if isinstance(child, dict) and isinstance(child.get("post"), dict):
+                posts.append(child["post"])
+    feed = (data.get("postFeed") or {}).get("elements") or {}
+    for edge in feed.get("edges") or []:
+        if isinstance(edge, dict) and isinstance(edge.get("node"), dict):
+            posts.append(edge["node"])
+    return posts
+
+
+def _call_error(r: httpx.Response) -> str | None:
+    """Error text when a /call response came back with an error status
+    (providers return 200 for real misses, but upstream failures like
+    tikhub's 400 "please retry" arrive as error statuses). Else None."""
+    if r.status_code < 400:
+        return None
+    try:
+        body = r.json()
+    except ValueError:
+        return f"HTTP {r.status_code}"
+    detail = body.get("detail") if isinstance(body, dict) else None
+    if isinstance(detail, dict):
+        return str(detail.get("message") or json.dumps(detail)[:200])
+    if detail:
+        return str(detail)
+    return f"HTTP {r.status_code}: {str(body)[:200]}"
+
+
+def _reddit_call(client: TregClient, target: str, method: str,
+                 params: list[tuple[str, str]] | None,
+                 body: str | None) -> httpx.Response:
+    """One Reddit call with a single retry after 2s. The providers (notably
+    tikhub) intermittently fail with 400 "please retry", and treg's routing
+    502s when every candidate for a team tool misses — a short retry
+    usually clears both. Runs in a worker thread."""
+    r = client.call(target, method, params, body)
+    if _call_error(r) is not None:
+        time.sleep(2.0)
+        r = client.call(target, method, params, body)
+    return r
 
 
 def pretty_json(obj: object) -> str:
@@ -523,6 +665,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self._x_posts: list[dict] = []
         self._x_trends: list[dict] = []
         self._x_selected: dict | None = None
+        self._r_posts: list[dict] = []
+        self._r_selected: dict | None = None
         self._md_links: dict[Gtk.TextView, list[tuple[int, int, str]]] = {}
 
         self._build_ui()
@@ -573,6 +717,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.tabs.append_page(self._build_call_tab(), Gtk.Label(label="Call"))
         self.tabs.append_page(self._build_history_tab(), Gtk.Label(label="History"))
         self.tabs.append_page(self._build_x_tab(), Gtk.Label(label="X"))
+        self.tabs.append_page(self._build_reddit_tab(), Gtk.Label(label="Reddit"))
         self.tabs.set_current_page(0)
         root.pack_start(self.tabs, True, True, 0)
 
@@ -938,6 +1083,62 @@ class MainWindow(Gtk.ApplicationWindow):
         btn_row.pack_start(self.x_replies_btn, False, False, 0)
         btn_row.pack_start(self.x_profile_btn, False, False, 0)
         btn_row.pack_start(self.x_open_btn, False, False, 0)
+        w.pack_start(btn_row, False, False, 0)
+        return w
+
+    def _build_reddit_tab(self) -> Gtk.Widget:
+        w = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.r_mode = Gtk.ComboBoxText()
+        for label in ("Search", "Subreddit", "User"):
+            self.r_mode.append_text(label)
+        self.r_mode.set_active(0)
+        self.r_mode.connect("changed", self._r_mode_changed)
+        self.r_entry = Gtk.Entry()
+        self.r_entry.set_placeholder_text("search Reddit — keyword or phrase…")
+        self.r_entry.connect("activate", lambda e: self._r_go())
+        go = Gtk.Button(label="Go")
+        go.connect("clicked", lambda b: self._r_go())
+        row.pack_start(self.r_mode, False, False, 0)
+        row.pack_start(self.r_entry, True, True, 0)
+        row.pack_start(go, False, False, 0)
+        w.pack_start(row, False, False, 0)
+
+        paned = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL)
+
+        self.r_store = Gtk.ListStore(str, str, str, str, str, str)
+        self.r_table = Gtk.TreeView(model=self.r_store)
+        for header, col_idx in (("Author", 0), ("Title", 1), ("Subreddit", 2),
+                                ("Time", 3), ("Score", 4), ("Comments", 5)):
+            self.r_table.append_column(
+                Gtk.TreeViewColumn(header, Gtk.CellRendererText(), text=col_idx))
+        self.r_table.get_selection().connect("changed", lambda s: self._on_r_selected())
+        paned.pack1(self._scrolled(self.r_table), True, True)
+
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.r_image = Gtk.Image()
+        right.pack_start(self.r_image, False, False, 0)
+        self.r_detail = self._textview()
+        self.r_detail.connect("button-press-event", self._md_link_click)
+        right.pack_start(self._scrolled(self.r_detail), True, True, 0)
+        paned.pack2(right, True, True)
+        paned.set_position(560)
+        w.pack_start(paned, True, True, 0)
+
+        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.r_comments_btn = Gtk.Button(label="Comments")
+        self.r_comments_btn.set_sensitive(False)
+        self.r_comments_btn.connect("clicked", lambda b: self._r_comments())
+        self.r_profile_btn = Gtk.Button(label="Profile")
+        self.r_profile_btn.set_sensitive(False)
+        self.r_profile_btn.connect("clicked", lambda b: self._r_profile())
+        self.r_open_btn = Gtk.Button(label="Open on Reddit")
+        self.r_open_btn.set_sensitive(False)
+        self.r_open_btn.connect("clicked", lambda b: self._r_open())
+        btn_row.pack_start(self.r_comments_btn, False, False, 0)
+        btn_row.pack_start(self.r_profile_btn, False, False, 0)
+        btn_row.pack_start(self.r_open_btn, False, False, 0)
         w.pack_start(btn_row, False, False, 0)
         return w
 
@@ -1716,7 +1917,7 @@ class MainWindow(Gtk.ApplicationWindow):
             self.x_image.set_from_pixbuf(None)
             return
         url = p["media"][0]
-        self._spawn(_x_fetch_image, url,
+        self._spawn(_fetch_image, url,
                     on_ok=lambda data: self._x_image_loaded(data),
                     on_fail=lambda m: self.x_image.set_from_pixbuf(None))
 
@@ -1810,6 +2011,267 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def _x_open(self):
         p = self._x_selected
+        if p and p.get("url"):
+            try:
+                Gio.AppInfo.launch_default_for_uri(p["url"], None)
+            except GLib.Error as e:
+                self._error(f"could not open {p['url']}: {e.message}")
+
+    # -- Reddit tab ---------------------------------------------------------------
+
+    def _r_mode(self) -> str:
+        return ("search", "subreddit", "user")[self.r_mode.get_active()]
+
+    def _r_mode_changed(self, combo):
+        ph = ("search Reddit — keyword or phrase…",
+              "r/name — the subreddit's posts (r/ optional)",
+              "u/name — the user's posts (u/ optional)")[combo.get_active()]
+        self.r_entry.set_placeholder_text(ph)
+
+    def _r_go(self):
+        if self.client is None:
+            return
+        q = self.r_entry.get_text().strip()
+        if not q:
+            return
+        if self._r_mode() == "subreddit":
+            name = q[2:] if q.startswith("r/") else q
+            self._busy(f"Posts of r/{name}…")
+            self._spawn(_reddit_call, self.client, "scrapecreators.reddit.subreddit.posts",
+                        "GET", [("subreddit", name)], None,
+                        on_ok=self._r_posts_done,
+                        on_fail=lambda m: self._error(f"subreddit: {m}"))
+        elif self._r_mode() == "user":
+            handle = q[2:] if q.startswith("u/") else q
+            self._busy(f"Posts of u/{handle}…")
+            self._spawn(_reddit_call, self.client, "tikhub.x.reddit-app-fetch-user-posts",
+                        "GET", [("username", handle)], None,
+                        on_ok=self._r_posts_done,
+                        on_fail=lambda m: self._error(f"posts: {m}"))
+        else:
+            self._busy(f"Searching Reddit for “{q}”…")
+            # scrapecreators' search is the stable one; tikhub's dynamic
+            # search fails intermittently with 400 "please retry".
+            self._spawn(_reddit_call, self.client, "scrapecreators.reddit.search.posts",
+                        "GET", [("query", q)], None,
+                        on_ok=self._r_posts_done,
+                        on_fail=lambda m: self._error(f"search: {m}"))
+
+    def _r_status(self, n: int, r: httpx.Response, noun: str = "posts"):
+        bits = [f"{n} {noun}"]
+        if r.headers.get("X-Treg-Cost-Micro") is not None:
+            bits.append(f"charged {usd(int(r.headers['X-Treg-Cost-Micro']))}")
+        self._busy(" · ".join(bits))
+
+    def _r_posts_done(self, r: httpx.Response):
+        if err := _call_error(r):
+            self._error(f"Reddit: {err}")
+            return
+        try:
+            body = r.json()
+        except ValueError:
+            self._error("Reddit: response was not JSON")
+            return
+        posts = _reddit_posts_of(body)
+        if not posts:
+            tried = ((body.get("_treg") or {}) if isinstance(body, dict) else {}).get("tried") or []
+            note = f" (every provider missed: {len(tried)} tried)" if tried else ""
+            self._error(f"no posts found{note}")
+            return
+        self._r_posts = [_reddit_norm_post(p) for p in posts]
+        self._r_fill_posts()
+        self._r_status(len(self._r_posts), r)
+
+    def _r_fill_posts(self):
+        self.r_store.clear()
+        for p in self._r_posts:
+            self.r_store.append([
+                p["author"], p["title"][:120], p["subreddit"], _reddit_when(p["created"]),
+                _count(p["score"]), _count(p["comments"])])
+
+    def _on_r_selected(self):
+        model, treeiter = self.r_table.get_selection().get_selected()
+        if treeiter is None:
+            return
+        idx = model.get_path(treeiter).get_indices()[0]
+        if idx >= len(self._r_posts):
+            return
+        self._r_selected = self._r_posts[idx]
+        # The feed row already carries the full post, so show it at once;
+        # the detail call then enriches it (Markdown body, media, flair).
+        self._r_render_detail()
+        self._r_load_detail()
+
+    def _r_load_detail(self):
+        p = self._r_selected
+        if not p or not p["id"] or self.client is None:
+            return
+        self._busy(f"Loading {p['id']}…")
+        self._spawn(_reddit_call, self.client, "treg.reddit.post.detail", "POST", None,
+                    json.dumps({"post_id": p["id"]}),
+                    on_ok=self._r_detail_done,
+                    on_fail=lambda m: self._error(f"full post: {m} (feed data shown)"))
+
+    def _r_detail_done(self, r: httpx.Response):
+        if err := _call_error(r):
+            self._error(f"full post: {err} (feed data shown)")
+            return
+        try:
+            body = r.json()
+        except ValueError:
+            self._error("full post: response was not JSON (feed data shown)")
+            return
+        out = body.get("output") if isinstance(body, dict) else None
+        raw = out.get("post") if isinstance(out, dict) else None
+        if not isinstance(raw, dict) or not raw.get("id"):
+            self._error("full post: no post returned (feed data shown)")
+            return
+        p = _reddit_norm_post(raw)
+        # A newer selection may have come in while this call was in flight.
+        if self._r_selected and self._r_selected.get("id") == p["id"]:
+            self._r_selected = p
+            self._r_render_detail()
+        self._r_status(1, r, noun="post")
+
+    def _r_render_detail(self):
+        p = self._r_selected
+        if not p:
+            return
+        lines = [f"**{p['title']}**"]
+        meta = [f"u/{p['author']}" if p["author"] else "unknown author"]
+        if p["subreddit"]:
+            meta.append(p["subreddit"])
+        if p["created"]:
+            meta.append(_reddit_when(p["created"]))
+        if p["flair"]:
+            meta.append(f"({p['flair']})")
+        lines.append("  ·  ".join(meta))
+        lines += [""]
+        if p["body"]:
+            lines += [p["body"], ""]
+        stats = [f"{_count(p['score'])} score", f"{_count(p['comments'])} comments"]
+        lines.append(" · ".join(stats))
+        lines += ["", f"[Open on Reddit]({p['url']})"]
+        self._render_md(self.r_detail, "\n".join(lines))
+        self.r_comments_btn.set_sensitive(bool(p["id"]))
+        self.r_profile_btn.set_sensitive(bool(p["author"]))
+        self.r_open_btn.set_sensitive(bool(p["url"]))
+        self._r_show_image(p)
+
+    def _r_show_image(self, p: dict):
+        if not p.get("image"):
+            self.r_image.set_from_pixbuf(None)
+            return
+        self._spawn(_fetch_image, p["image"],
+                    on_ok=lambda data: self._r_image_loaded(data),
+                    on_fail=lambda m: self.r_image.set_from_pixbuf(None))
+
+    def _r_image_loaded(self, data):
+        if not data:
+            self.r_image.set_from_pixbuf(None)
+            return
+        stream = Gio.MemoryInputStream.new_from_bytes(GLib.Bytes.new(data))
+        try:
+            pixbuf = GdkPixbuf.Pixbuf.new_from_stream(stream, None)
+        except GLib.Error:
+            self.r_image.set_from_pixbuf(None)
+            return
+        w, h = pixbuf.get_width(), pixbuf.get_height()
+        if w > 560:
+            pixbuf = pixbuf.scale_simple(560, max(1, int(h * 560 / w)),
+                                         GdkPixbuf.InterpType.BILINEAR)
+        self.r_image.set_from_pixbuf(pixbuf)
+
+    def _r_comments(self):
+        p = self._r_selected
+        if not p or not p["id"] or self.client is None:
+            return
+        self._busy(f"Comments for {p['id']}…")
+        self._spawn(_reddit_call, self.client, "tikhub.x.reddit-app-fetch-post-comments",
+                    "GET", [("post_id", p["id"])], None,
+                    on_ok=self._r_comments_done,
+                    on_fail=lambda m: self._error(f"comments: {m}"))
+
+    def _r_comments_done(self, r: httpx.Response):
+        if err := _call_error(r):
+            self._error(f"comments: {err}")
+            return
+        try:
+            body = r.json()
+        except ValueError:
+            self._error("comments: response was not JSON")
+            return
+        data = body.get("data") if isinstance(body, dict) else None
+        forest = ((data or {}).get("postInfoById") or {}).get("commentForest") or {}
+        trees = [t for t in (forest.get("trees") or [])
+                 if isinstance(t, dict) and isinstance(t.get("node"), dict)]
+        if not trees:
+            self._error("no comments returned")
+            return
+        lines = [f"**Comments** ({len(trees)})", ""]
+        for t in trees:
+            node = t["node"]
+            depth = min(int(t.get("depth") or 0), 5)
+            author = ((node.get("authorInfo") or {}).get("name")) or ""
+            score = node.get("score") or 0
+            lines.append(("↳ " * depth) + f"**u/{author}**  ({_count(score)})")
+            md = ((node.get("content") or {}).get("markdown")) or ""
+            if md:
+                lines += [ln for ln in md.splitlines()]
+            lines.append("")
+        self._render_md(self.r_detail, "\n".join(lines))
+        self._r_status(len(trees), r, noun="comments")
+
+    def _r_profile(self):
+        p = self._r_selected
+        if not p or not p["author"] or self.client is None:
+            return
+        self._busy(f"Profile of u/{p['author']}…")
+        self._spawn(_reddit_call, self.client, "tikhub.x.reddit-app-fetch-user-profile",
+                    "GET", [("username", p["author"])], None,
+                    on_ok=self._r_profile_done,
+                    on_fail=lambda m: self._error(f"profile: {m}"))
+
+    def _r_profile_done(self, r: httpx.Response):
+        if err := _call_error(r):
+            self._error(f"profile: {err}")
+            return
+        try:
+            body = r.json()
+        except ValueError:
+            self._error("profile: response was not JSON")
+            return
+        user = ((body.get("data") if isinstance(body, dict) else None) or {}).get("redditorInfoByName") or {}
+        if not user.get("name"):
+            self._error("no profile returned")
+            return
+        prof = user.get("profile") or {}
+        head = user.get("prefixedName") or user["name"]
+        if user.get("isVerified"):
+            head += "  ✓"
+        lines = [f"**{head}**"]
+        if prof.get("title"):
+            lines.append(prof["title"])
+        if prof.get("publicDescriptionText"):
+            lines.append(prof["publicDescriptionText"])
+        if prof.get("createdAt"):
+            lines += ["", f"Joined: {_reddit_when(prof['createdAt'])}"]
+        links = [l for l in (prof.get("socialLinks") or [])
+                 if isinstance(l, dict) and l.get("outboundUrl")]
+        if links:
+            lines += ["", "**Links**"]
+            lines += [f"[{l.get('title') or l['outboundUrl']}]({l['outboundUrl']})"
+                      for l in links]
+        icon = user.get("newIcon") or {}
+        if icon.get("url"):
+            lines += ["", f"[profile picture]({icon['url']})"]
+        lines += ["", f"[Open u/{user['name']} on Reddit]"
+                  f"(https://www.reddit.com/user/{user['name']}/)"]
+        self._render_md(self.r_detail, "\n".join(lines))
+        self._r_status(1, r, noun="profile")
+
+    def _r_open(self):
+        p = self._r_selected
         if p and p.get("url"):
             try:
                 Gio.AppInfo.launch_default_for_uri(p["url"], None)
