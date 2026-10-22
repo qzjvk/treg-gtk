@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=treg console
+Comment=Desktop console for the treg tool catalog — search, call, audit 4,000+ endpoints, and summarize web results with an LLM
+Exec=treg-console
+Icon=treg-console
+Terminal=false
+Categories=Development;
+Keywords=treg;api;tools;catalog;endpoints;summarize;
+StartupNotify=true

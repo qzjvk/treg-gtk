@@ -1,0 +1,22 @@
+[build-system]
+requires = ["meson-python>=0.16.0", "meson>=1.8.0", "ninja"]
+build-backend = "mesonpy"
+
+[project]
+name = "treg-console"
+version = "1.0.0"
+description = "Native Linux desktop console for the treg tool catalog (https://treg.to)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "gs" }]
+keywords = ["treg", "gtk3", "pygobject", "api", "tool-catalog"]
+classifiers = [
+  "Environment :: X11 Applications :: GTK",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+]
+dependencies = [
+  "PyGObject>=3.40",
+  "httpx>=0.27",
+]

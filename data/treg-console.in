@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""Launcher for treg console — installed to bindir by meson."""
+import sys
+
+from treg_console.app import main
+
+if __name__ == "__main__":
+    sys.exit(main())
