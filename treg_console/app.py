@@ -10,7 +10,8 @@ Tabs:
   Browse   — search the web, click a result, read the page (the simple path)
   AI       — AI interaction: chat with the local model, which can call every
              data source in the app as a tool (treg catalog + any endpoint,
-             web, X, Reddit, News, Markets) and answer in Markdown
+             web, X, Reddit, News, Markets, Hacker News, GitHub, OLX.pt) and
+             answer in Markdown
   Catalog  — search the 4,000+ endpoint catalog, inspect params/price/reliability
   Providers — browse the platform catalog by category, drill into a
              platform's capabilities and endpoints
@@ -33,6 +34,9 @@ Tabs:
   GitHub   — a GitHub frontend: repository search, trending, repo detail with
              README, issues/PRs and releases via the free public API, with
              Ask AI / AI digest
+  OLX      — an OLX.pt frontend: classifieds search with category, price and
+             sort filters, or any listing by id or URL, via the free public
+             JSON API, with Ask AI / AI digest
   Ctrl+K   — a command palette that jumps to any tab, searches a source, or
              hands the query to the AI
   Alt+<n>  — switch tabs from anywhere: Alt+1…Alt+9, Alt+0 for the tenth,
@@ -78,6 +82,9 @@ from .markets import (MAJOR_COINS, yf_coins, yf_crypto_quote, yf_fundamentals,
                       yf_history, yf_quote)
 from .news import (TOPIC_LABELS as NEWS_TOPIC_LABELS, digest_prompt,
                    fetch_topic, relative_time as news_when, search_news)
+from .olx import (CATEGORIES as OLX_CATEGORIES,
+                  digest_prompt as olx_digest_prompt,
+                  listing as olx_listing, search as olx_search)
 from .parsing import (call_error as _call_error, page_markdown as _page_markdown,
                       pretty_json, reddit_call as _reddit_call,
                       reddit_norm_post as _reddit_norm_post,
@@ -561,11 +568,12 @@ class Worker(threading.Thread):
 class MainWindow(Gtk.ApplicationWindow):
     AI_HINT = ("**AI interaction** — ask anything. I can use every data source "
                "in the app as a tool: the treg catalog and any endpoint, web "
-               "search and pages, X, Reddit, News, Markets, Hacker News and "
-               "GitHub.\n\n"
+               "search and pages, X, Reddit, News, Markets, Hacker News, "
+               "GitHub and OLX.pt.\n\n"
                "Try: *“what's moving in the market today and why?”*, "
                "*“summarize the top tech news”*, *“what's hot on Hacker News "
                "right now?”*, *“compare Rust web frameworks on GitHub”*, "
+               "*“find an iPhone 13 under 300 € on OLX”*, "
                "*“find an endpoint for backlinks and call it for "
                "example.com”*.")
 
@@ -599,6 +607,10 @@ class MainWindow(Gtk.ApplicationWindow):
         self._gh_selected: dict | None = None
         self._gh_label = "GitHub"
         self._gh_readme = ""
+        self._olx_items: list[dict] = []
+        self._olx_selected: dict | None = None
+        self._olx_result: dict = {}
+        self._olx_label = "OLX.pt"
         self._palette: Gtk.Dialog | None = None
         self._palette_rows: list[tuple[str, str, str, object]] = []
         self._md_links: dict[Gtk.TextView, list[tuple[int, int, str]]] = {}
@@ -667,6 +679,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self._add_tab(self._build_news_tab(), "News")
         self._add_tab(self._build_hn_tab(), "Hacker News")
         self._add_tab(self._build_gh_tab(), "GitHub")
+        self._add_tab(self._build_olx_tab(), "OLX")
         self.tabs.set_current_page(0)
         root.pack_start(self.tabs, True, True, 0)
 
@@ -1445,6 +1458,108 @@ class MainWindow(Gtk.ApplicationWindow):
             "*Search repositories, load **Trending**, or enter a repo as "
             "**owner/name** for **Repo**, **Issues** or **Releases**. Free — "
             "the GitHub public API, no treg calls.*")
+        return w
+
+    def _build_olx_tab(self) -> Gtk.Widget:
+        """An OLX.pt frontend backed by the site's free public JSON API:
+        search classifieds by keyword, category and price, or open a listing
+        by id or URL. No treg calls. Ask AI and AI digest hand the current
+        view to the AI tab, which can also compare listings with olx_search."""
+        w = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.olx_mode = Gtk.ComboBoxText()
+        self.olx_mode.append("search", "Search")
+        self.olx_mode.append("listing", "Listing")
+        self.olx_mode.set_active_id("search")
+        self.olx_mode.connect("changed", self._olx_mode_changed)
+        self.olx_entry = Gtk.Entry()
+        self.olx_entry.set_placeholder_text(
+            "search OLX.pt — leave empty for the latest listings")
+        self.olx_entry.connect("activate", lambda e: self._olx_go())
+        self.olx_limit = Gtk.SpinButton.new_with_range(5, 50, 5)
+        self.olx_limit.set_value(25)
+        self.olx_limit.set_size_request(64, -1)
+        self.olx_limit.set_tooltip_text("listings to show (OLX's maximum is 50)")
+        go = Gtk.Button(label="Go")
+        go.connect("clicked", lambda b: self._olx_go())
+        row.pack_start(self.olx_mode, False, False, 0)
+        row.pack_start(self.olx_entry, True, True, 0)
+        row.pack_start(self.olx_limit, False, False, 0)
+        row.pack_start(go, False, False, 0)
+        w.pack_start(row, False, False, 0)
+
+        filters = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.olx_category = Gtk.ComboBoxText()
+        for name, cid, _slug in OLX_CATEGORIES:
+            self.olx_category.append("" if cid is None else str(cid), name)
+        self.olx_category.set_active(0)
+        self.olx_category.set_tooltip_text("category filter")
+        self.olx_sort = Gtk.ComboBoxText()
+        self.olx_sort.append("relevance", "Relevance")
+        self.olx_sort.append("cheapest", "Cheapest")
+        self.olx_sort.append("expensive", "Most expensive")
+        self.olx_sort.set_active_id("relevance")
+        self.olx_sort.set_tooltip_text("result order")
+        self.olx_price_min = Gtk.SpinButton.new_with_range(0, 10_000_000, 50)
+        self.olx_price_min.set_size_request(92, -1)
+        self.olx_price_min.set_tooltip_text("minimum price in € (0 = any)")
+        self.olx_price_max = Gtk.SpinButton.new_with_range(0, 10_000_000, 50)
+        self.olx_price_max.set_size_request(92, -1)
+        self.olx_price_max.set_tooltip_text("maximum price in € (0 = any)")
+        filters.pack_start(self.olx_category, False, False, 0)
+        filters.pack_start(self.olx_sort, False, False, 0)
+        filters.pack_start(Gtk.Label(label="price"), False, False, 0)
+        filters.pack_start(self.olx_price_min, False, False, 0)
+        filters.pack_start(Gtk.Label(label="–"), False, False, 0)
+        filters.pack_start(self.olx_price_max, False, False, 0)
+        filters.pack_start(Gtk.Label(label="€"), False, False, 0)
+        self.olx_filters = filters
+        w.pack_start(filters, False, False, 0)
+
+        paned = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL)
+        self.olx_store = Gtk.ListStore(str, str)
+        self.olx_table = Gtk.TreeView(model=self.olx_store)
+        for header, col_idx in (("Listing", 0), ("Price · place", 1)):
+            col = Gtk.TreeViewColumn(header, Gtk.CellRendererText(),
+                                     text=col_idx)
+            if col_idx == 0:
+                col.set_expand(True)
+            self.olx_table.append_column(col)
+        self.olx_table.get_selection().connect(
+            "changed", lambda s: self._on_olx_selected())
+        paned.pack1(self._scrolled(self.olx_table), True, True)
+        self.olx_detail = self._textview()
+        self.olx_detail.connect("button-press-event", self._md_link_click)
+        paned.pack2(self._scrolled(self.olx_detail), True, True)
+        paned.set_position(620)
+        w.pack_start(paned, True, True, 0)
+
+        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.olx_open_btn = Gtk.Button(label="Open on OLX")
+        self.olx_open_btn.set_sensitive(False)
+        self.olx_open_btn.connect("clicked", lambda b: self._olx_open())
+        self.olx_digest_btn = Gtk.Button(label="AI digest")
+        self.olx_digest_btn.set_tooltip_text(
+            f"Summarize the current listings in the AI tab ({AI_MODEL})")
+        self.olx_digest_btn.set_sensitive(False)
+        self.olx_digest_btn.connect("clicked", lambda b: self._olx_digest())
+        self.olx_ask_btn = Gtk.Button(label="Ask AI")
+        self.olx_ask_btn.set_tooltip_text(
+            "Ask the AI about the selected listing — it can compare similar "
+            "listings and judge the price")
+        self.olx_ask_btn.set_sensitive(False)
+        self.olx_ask_btn.connect("clicked", lambda b: self._olx_ask_ai())
+        btn_row.pack_start(self.olx_open_btn, False, False, 0)
+        btn_row.pack_start(self.olx_digest_btn, False, False, 0)
+        btn_row.pack_start(self.olx_ask_btn, False, False, 0)
+        w.pack_start(btn_row, False, False, 0)
+
+        self._render_md(
+            self.olx_detail,
+            "*Search OLX.pt by keyword, or choose a category and leave the "
+            "query empty to browse it. Filter by price, sort, then press "
+            "**Go**. Free — OLX's public JSON API, no treg calls.*")
         return w
 
     # -- plumbing -------------------------------------------------------------
@@ -3666,6 +3781,228 @@ class MainWindow(Gtk.ApplicationWindow):
             context,
             display=f"Explain this GitHub item: {p.get('title', '')}")
 
+    # -- OLX tab ---------------------------------------------------------------
+
+    def _olx_mode_changed(self, *args):
+        listing = (self.olx_mode.get_active_id() or "search") == "listing"
+        self.olx_entry.set_placeholder_text(
+            "OLX listing ID or URL — e.g. 674732003" if listing else
+            "search OLX.pt — leave empty for the latest listings")
+        self.olx_filters.set_sensitive(not listing)
+        self.olx_limit.set_sensitive(not listing)
+        self._olx_items = []
+        self._olx_selected = None
+        self._olx_result = {}
+        self._olx_label = "OLX.pt"
+        self.olx_store.clear()
+        self.olx_open_btn.set_sensitive(False)
+        self.olx_digest_btn.set_sensitive(False)
+        self.olx_ask_btn.set_sensitive(False)
+        self._render_md(
+            self.olx_detail,
+            "*Paste an OLX.pt URL or numeric id and press **Go** for the "
+            "full listing.*" if listing else
+            "*Search OLX.pt by keyword, or choose a category and leave the "
+            "query empty to browse it. Filter by price, sort, then press "
+            "**Go**. Free — OLX's public JSON API, no treg calls.*")
+
+    def _olx_go(self):
+        mode = self.olx_mode.get_active_id() or "search"
+        value = self.olx_entry.get_text().strip()
+        if mode == "listing":
+            if not value:
+                self._error("enter an OLX listing id or URL")
+                return
+            self._busy(f"Loading OLX listing {value[:60]}…")
+            self._spawn(olx_listing, value,
+                        on_ok=self._olx_listing_loaded,
+                        on_fail=lambda m: self._error(f"OLX: {m}"))
+            return
+        cat_id = self.olx_category.get_active_id() or None
+        pmin = int(self.olx_price_min.get_value()) or None
+        pmax = int(self.olx_price_max.get_value()) or None
+        sort = self.olx_sort.get_active_id() or "relevance"
+        limit = int(self.olx_limit.get_value())
+        self._busy(f"Searching OLX.pt for “{value}”…" if value
+                   else "Loading OLX.pt listings…")
+        self._spawn(
+            lambda: olx_search(value, category=cat_id, price_min=pmin,
+                               price_max=pmax, sort=sort, limit=limit),
+            on_ok=self._olx_loaded,
+            on_fail=lambda m: self._error(f"OLX: {m}"))
+
+    def _olx_loaded(self, out: dict):
+        self._olx_result = out or {}
+        self._olx_items = (out or {}).get("rows") or []
+        self._olx_selected = None
+        self._olx_label = self._olx_result_label(out or {})
+        self.olx_store.clear()
+        for it in self._olx_items:
+            self.olx_store.append([it.get("title") or "(untitled)",
+                                   it.get("meta") or ""])
+        self.olx_open_btn.set_sensitive(False)
+        self.olx_ask_btn.set_sensitive(False)
+        self.olx_digest_btn.set_sensitive(bool(self._olx_items))
+        if not self._olx_items:
+            self._render_md(
+                self.olx_detail,
+                f"*No OLX.pt listings for {_esc(self._olx_label)} — try a "
+                "broader query or another category.*")
+            self._error(f"OLX: no listings for {self._olx_label}")
+            return
+        total = int((out or {}).get("total") or len(self._olx_items))
+        self._render_md(
+            self.olx_detail,
+            f"**{_esc(self._olx_label)}** — {len(self._olx_items)} of "
+            f"{total:,} listings\n\n"
+            "*Select a row for the full listing, **Open on OLX** in the "
+            "browser, **Ask AI** to judge it, or **AI digest** to summarize "
+            "the list.*")
+        self.olx_table.get_selection().select_path(
+            Gtk.TreePath.new_from_string("0"))
+        self._busy(f"{len(self._olx_items)} of {total:,} listings · "
+                   "OLX.pt (free)")
+
+    def _olx_result_label(self, out: dict) -> str:
+        q = out.get("query") or ""
+        cat = out.get("category") or ""
+        if q and cat and cat != "All categories":
+            return f"{q} · {cat}"
+        if q:
+            return f"Search: {q}"
+        if cat and cat != "All categories":
+            return f"Category: {cat}"
+        return "Latest listings"
+
+    def _olx_listing_loaded(self, row: dict):
+        self._olx_items = [row] if row else []
+        self._olx_selected = row or None
+        self._olx_result = {"rows": self._olx_items, "total": 1,
+                            "query": "", "category": ""}
+        self._olx_label = f"Listing {row.get('id')}" if row else "Listing"
+        self.olx_store.clear()
+        if row:
+            self.olx_store.append([row.get("title") or "",
+                                   row.get("meta") or ""])
+        self.olx_open_btn.set_sensitive(bool(row and row.get("url")))
+        self.olx_ask_btn.set_sensitive(bool(row))
+        self.olx_digest_btn.set_sensitive(bool(row))
+        if not row:
+            self._error("OLX: no listing found")
+            return
+        self._olx_render_detail()
+        self._busy(f"{row.get('title', '')[:60]} · OLX.pt (free)")
+
+    def _on_olx_selected(self):
+        model, it = self.olx_table.get_selection().get_selected()
+        if it is None:
+            return
+        idx = model.get_path(it).get_indices()[0]
+        if idx >= len(self._olx_items):
+            return
+        self._olx_selected = self._olx_items[idx]
+        self._olx_render_detail()
+
+    def _olx_render_detail(self):
+        p = self._olx_selected
+        if not p:
+            return
+        price = p.get("price") or {}
+        price_label = price.get("label") or "Price not stated"
+        lines = [f"**{_esc(p.get('title') or '(untitled)')}**", ""]
+        head = f"**{_esc(price_label)}**"
+        if price.get("negotiable"):
+            head += " · negotiable"
+        if p.get("promoted"):
+            head += " · promoted"
+        lines += [head, ""]
+        loc = p.get("location") or {}
+        when = news_when(p["ts"]) if p.get("ts") else ""
+        bits = []
+        if loc.get("label"):
+            bits.append(_esc(loc["label"]))
+        if when:
+            bits.append(f"posted {_esc(when)}")
+        if p.get("category"):
+            bits.append(_esc(p["category"]))
+        if bits:
+            lines += [" · ".join(bits), ""]
+        seller = p.get("seller") or {}
+        if seller.get("name"):
+            kind = "business" if p.get("is_business") else "private"
+            lines += [f"Seller: **{_esc(seller['name'])}** ({kind})", ""]
+        attrs = p.get("attrs") or {}
+        if attrs:
+            lines.append("**Details**")
+            for k, v in attrs.items():
+                lines.append(f"- **{_esc(k)}:** {_esc(v)}")
+            lines.append("")
+        desc = p.get("description") or ""
+        if desc:
+            lines += ["**Description**", "", _esc(desc), ""]
+        photos = p.get("photos") or []
+        if photos:
+            links = " · ".join(f"[{i}]({u})"
+                               for i, u in enumerate(photos[:6], 1))
+            lines += [f"**Photos ({p.get('photo_count') or len(photos)}):** "
+                      f"{links}", ""]
+        if p.get("url"):
+            lines.append(f"[Open on OLX]({p['url']})")
+        self._render_md(self.olx_detail, "\n".join(lines))
+        self.olx_open_btn.set_sensitive(bool(p.get("url")))
+        self.olx_ask_btn.set_sensitive(True)
+
+    def _olx_open(self):
+        p = self._olx_selected
+        if p and p.get("url"):
+            try:
+                Gio.AppInfo.launch_default_for_uri(p["url"], None)
+            except GLib.Error as e:
+                self._error(f"could not open {p['url']}: {e.message}")
+
+    def _olx_digest(self):
+        rows = self._olx_items
+        if not rows:
+            self._error("search for some listings first, then press AI digest")
+            return
+        out = self._olx_result or {}
+        total = out.get("total")
+        self._ai_ask(
+            "Write a digest of these OLX.pt listings below. You can call "
+            "olx_search to compare prices or find more options.",
+            olx_digest_prompt(self._olx_label, rows, total),
+            display=f"Write a digest of the OLX.pt {self._olx_label} listings.")
+        self._busy(f"AI is digesting {min(len(rows), 15)} OLX listings…")
+
+    def _olx_ask_ai(self):
+        p = self._olx_selected
+        if not p:
+            self._error("select a listing first")
+            return
+        loc = (p.get("location") or {}).get("label") or ""
+        attrs = "; ".join(f"{k}: {v}"
+                          for k, v in (p.get("attrs") or {}).items())
+        context = (
+            f"OLX.pt tab — {self._olx_label}\n"
+            f"Listing: {p.get('title') or ''}\n"
+            f"Price: {p.get('price_label') or 'not stated'}\n"
+            f"Location: {loc}\n"
+            f"Category: {p.get('category') or ''}\n"
+            f"Seller: {(p.get('seller') or {}).get('name') or ''}"
+            f" ({'business' if p.get('is_business') else 'private'})\n"
+            f"Details: {attrs}\n"
+            f"URL: {p.get('url') or ''}\n"
+            f"\nDescription:\n{(p.get('description') or '')[:4000]}\n"
+            f"\nOn screen:\n{self._text(self.olx_detail)[:8000]}"
+        )
+        self._ai_ask(
+            "Explain this OLX.pt listing: what is being sold, whether the "
+            "asking price looks fair for the Portuguese market, what to check "
+            "before buying, and what to ask the seller. Use olx_search to "
+            "compare similar listings.",
+            context,
+            display=f"Explain this OLX.pt listing: {p.get('title', '')}")
+
     # -- command palette (Ctrl+K) ---------------------------------------------
 
     def _tab_index(self, label: str) -> int:
@@ -3819,6 +4156,11 @@ class MainWindow(Gtk.ApplicationWindow):
                          "news", q))
             rows.append((f"Search Hacker News for: {q}", "free Algolia index",
                          "hn", q))
+            rows.append((f"Search OLX.pt for: {q}", "classifieds in Portugal",
+                         "olx_search", q))
+            if q.isdigit() or "olx.pt" in q:
+                rows.append((f"Open OLX listing: {q}",
+                             "price, place and details", "olx_listing", q))
             rows.append((f"Browse the web for: {q}", "treg web search",
                          "browse", q))
             if re.fullmatch(r"[A-Za-z][A-Za-z0-9.\-^=]{0,5}", q):
@@ -3887,6 +4229,16 @@ class MainWindow(Gtk.ApplicationWindow):
             self.gh_mode.set_active(_GH_MODES.index("repo"))
             self.gh_entry.set_text(str(payload))
             self._gh_go()
+        elif action == "olx_search":
+            self.tabs.set_current_page(self._tab_index("OLX"))
+            self.olx_mode.set_active_id("search")
+            self.olx_entry.set_text(str(payload))
+            self._olx_go()
+        elif action == "olx_listing":
+            self.tabs.set_current_page(self._tab_index("OLX"))
+            self.olx_mode.set_active_id("listing")
+            self.olx_entry.set_text(str(payload))
+            self._olx_go()
         elif action == "markets":
             self.tabs.set_current_page(self._tab_index("Markets"))
             self.m_mode.set_active(0)

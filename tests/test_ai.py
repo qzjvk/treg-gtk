@@ -62,6 +62,15 @@ class RegistryTest(unittest.TestCase):
         self.assertIn("Hacker News", summary)
         self.assertIn("GitHub", summary)
 
+    def test_built_registry_covers_olx(self):
+        reg = ai.build_registry(None)
+        names = set(reg.names())
+        for expected in ("olx_search", "olx_listing", "olx_categories"):
+            self.assertIn(expected, names)
+
+    def test_tool_summary_lists_olx(self):
+        self.assertIn("OLX.pt", ai.tool_summary())
+
 
 class ParseActionTest(unittest.TestCase):
     def test_fenced_json_action(self):

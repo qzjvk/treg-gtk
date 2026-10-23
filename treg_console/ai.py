@@ -3,10 +3,10 @@
 One OpenAI-compatible chat endpoint (the same local server the old Summarize
 tab used) becomes an agent with tools: the treg catalog (every endpoint,
 `treg_call` for anything), web search/extract, X, Reddit, News (RSS + treg
-search), Hacker News (free official API), GitHub (free public API) and
-Markets (yfinance). Native OpenAI tool calling is used when the server
-supports it; otherwise the agent falls back to a fenced-JSON tool protocol in
-plain chat.
+search), Hacker News (free official API), GitHub (free public API), OLX.pt
+classifieds (free public JSON API) and Markets (yfinance). Native OpenAI tool
+calling is used when the server supports it; otherwise the agent falls back
+to a fenced-JSON tool protocol in plain chat.
 
 All functions here are synchronous and blocking — call them from a worker
 thread, never from the GUI thread.
@@ -42,6 +42,8 @@ from .hackernews import (comment_tree as hn_comment_tree, feed as hn_feed,
 from .markets import (MAJOR_COINS, yf_coins, yf_crypto_quote, yf_fundamentals,
                       yf_history, yf_quote)
 from .news import fetch_topic, search_news
+from .olx import (categories as olx_categories, listing as olx_listing,
+                  search as olx_search)
 from .parsing import (page_markdown, reddit_call, reddit_norm_post,
                       reddit_posts_of, search_results, x_norm_post)
 
@@ -594,6 +596,47 @@ def build_registry(client: TregClient | None,
         "A GitHub repo's releases, newest first (tag, name, author, notes). "
         "Free.", {"repo": _STR, "limit": _INT}, ["repo"], gh_releases_tool)
 
+    # -- OLX.pt (free, public JSON API) ------------------------------------
+
+    def olx_search_tool(a: dict) -> object:
+        return olx_search(
+            str(a.get("query") or ""),
+            category=a.get("category"),
+            region_id=a.get("region_id"),
+            city_id=a.get("city_id"),
+            price_min=a.get("price_min"),
+            price_max=a.get("price_max"),
+            sort=str(a.get("sort") or "relevance"),
+            limit=int(a.get("limit") or 20),
+            offset=int(a.get("offset") or 0),
+        )
+
+    reg.add(
+        "olx_search",
+        "Search OLX.pt (Portugal) classifieds by keyword, category, price "
+        "range, region or city. Rows carry title, price in EUR, location, "
+        "age, condition/details, seller and URL; the result also has the "
+        "total match count. Free — OLX's public JSON API, no treg charge. "
+        "An empty query with a category browses that category.",
+        {"query": _STR, "category": _STR, "price_min": _INT, "price_max": _INT,
+         "region_id": _INT, "city_id": _INT,
+         "sort": {"type": "string",
+                  "enum": ["relevance", "cheapest", "expensive"]},
+         "limit": _INT, "offset": _INT},
+        [], olx_search_tool)
+    reg.add(
+        "olx_listing",
+        "One OLX.pt listing in full by numeric id or olx.pt URL: price, "
+        "location, seller, every attribute, the full description and photo "
+        "links. Free.",
+        {"listing": _STR}, ["listing"],
+        lambda a: olx_listing(str(a["listing"])))
+    reg.add(
+        "olx_categories",
+        "OLX.pt's top-level categories with their ids. Use one as the "
+        "`category` argument of olx_search (a name or slug works too). Free.",
+        {}, [], lambda a: olx_categories())
+
     # -- Markets (yfinance, free) ------------------------------------------
 
     def market_quote(a: dict) -> object:
@@ -674,16 +717,17 @@ def system_prompt() -> str:
         f"Today is {today}.\n\n"
         "You have tools for the treg catalog (thousands of API endpoints), "
         "web search and page reading, X/Twitter, Reddit, news (free RSS and "
-        "treg news search), Hacker News (free), GitHub (free) and markets "
-        "(stocks, fundamentals, crypto). Use them instead of guessing whenever "
-        "the question involves current facts, prices, code, posts or news. "
+        "treg news search), Hacker News (free), GitHub (free), OLX.pt "
+        "classifieds (free) and markets (stocks, fundamentals, crypto). Use "
+        "them instead of guessing whenever the question involves current "
+        "facts, prices, code, classifieds, posts or news. "
         "Chain tools when needed: e.g. search the catalog, inspect an "
         "endpoint, then call it.\n\n"
         "Costs: treg_*, web_*, x_* and reddit_* calls are paid (usually "
         "fractions of a cent) and charged to the team; news_top/news_tech/"
-        "news_business, the hn_* and github_* tools and market_*/crypto_* are "
-        "free. Prefer free tools when they answer the question, and do not "
-        "repeat an expensive call.\n\n"
+        "news_business, the hn_*, github_* and olx_* tools and market_*/"
+        "crypto_* are free. Prefer free tools when they answer the question, "
+        "and do not repeat an expensive call.\n\n"
         "Style: answer in Markdown, concisely. Give numbers with units and "
         "cite the URLs you relied on. If a tool fails, say what failed and "
         "try a reasonable alternative; never invent data. If the question is "
@@ -901,6 +945,7 @@ def tool_summary() -> str:
         "news": "News (free RSS + search)",
         "hn": "Hacker News (free)",
         "github": "GitHub (free)",
+        "olx": "OLX.pt (free)",
         "market": "Markets (stocks)",
         "crypto": "Crypto",
     }

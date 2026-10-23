@@ -1,6 +1,6 @@
 project(
   'treg-console',
-  version: '1.4.1',
+  version: '1.5.0',
   license: 'MIT',
   meson_version: '>=1.8.0',
 )
@@ -22,6 +22,7 @@ install_data(
   'treg_console/hackernews.py',
   'treg_console/markets.py',
   'treg_console/news.py',
+  'treg_console/olx.py',
   'treg_console/parsing.py',
   'treg_console/desktop.py',
   'treg_console/icon.png',

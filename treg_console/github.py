@@ -29,7 +29,7 @@ MAX_PER_PAGE = 100
 
 TOKEN = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or ""
 
-UA = "treg-console/1.4 (+https://treg.to)"
+UA = "treg-console/1.5 (+https://treg.to)"
 
 
 def _headers() -> dict:
