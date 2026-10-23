@@ -3,9 +3,9 @@
 One OpenAI-compatible chat endpoint (the same local server the old Summarize
 tab used) becomes an agent with tools: the treg catalog (every endpoint,
 `treg_call` for anything), web search/extract, X, Reddit, News (RSS + treg
-search) and Markets (yfinance). Native OpenAI tool calling is used when the
-server supports it; otherwise the agent falls back to a fenced-JSON tool
-protocol in plain chat.
+search), Hacker News (free official API) and Markets (yfinance). Native
+OpenAI tool calling is used when the server supports it; otherwise the agent
+falls back to a fenced-JSON tool protocol in plain chat.
 
 All functions here are synchronous and blocking — call them from a worker
 thread, never from the GUI thread.
@@ -33,6 +33,8 @@ from typing import Any, Callable
 import httpx
 
 from .client import TregClient, TregError, poll_async_task
+from .hackernews import (comment_tree as hn_comment_tree, feed as hn_feed,
+                         item_view as hn_item_view, search as hn_search)
 from .markets import (MAJOR_COINS, yf_coins, yf_crypto_quote, yf_fundamentals,
                       yf_history, yf_quote)
 from .news import fetch_topic, search_news
@@ -500,6 +502,44 @@ def build_registry(client: TregClient | None,
         "fractions of a cent).",
         {"query": _STR, "limit": _INT}, ["query"], news_search)
 
+    # -- Hacker News (free, official API) ----------------------------------
+
+    def hn_stories(a: dict) -> object:
+        return hn_feed(str(a.get("kind") or "top"), int(a.get("limit") or 20))
+
+    def hn_search_stories(a: dict) -> object:
+        return hn_search(str(a["query"]), int(a.get("limit") or 20))
+
+    def hn_item(a: dict) -> object:
+        return hn_item_view(int(a["item_id"]))
+
+    def hn_comments(a: dict) -> object:
+        return hn_comment_tree(int(a["item_id"]), int(a.get("limit") or 40))
+
+    reg.add(
+        "hn_stories",
+        "The Hacker News front page from the free official API: kind is one "
+        "of top, new, best, ask, show, jobs. Rows carry title, url, site, "
+        "points, author and comment count. No treg charge.",
+        {"kind": {"type": "string",
+                  "enum": ["top", "new", "best", "ask", "show", "jobs"]},
+         "limit": _INT}, [], hn_stories)
+    reg.add(
+        "hn_search",
+        "Search Hacker News stories by keyword through the free Algolia API. "
+        "No treg charge.",
+        {"query": _STR, "limit": _INT}, ["query"], hn_search_stories)
+    reg.add(
+        "hn_item",
+        "One Hacker News item (story, Ask/Show post or comment) in full by id, "
+        "with its plain-text body. Free.",
+        {"item_id": _INT}, ["item_id"], hn_item)
+    reg.add(
+        "hn_comments",
+        "The comment tree of a Hacker News story by id, flattened with a depth "
+        "per comment (indented replies). Free.",
+        {"item_id": _INT, "limit": _INT}, ["item_id"], hn_comments)
+
     # -- Markets (yfinance, free) ------------------------------------------
 
     def market_quote(a: dict) -> object:
@@ -580,14 +620,16 @@ def system_prompt() -> str:
         f"Today is {today}.\n\n"
         "You have tools for the treg catalog (thousands of API endpoints), "
         "web search and page reading, X/Twitter, Reddit, news (free RSS and "
-        "treg news search) and markets (stocks, fundamentals, crypto). Use "
-        "them instead of guessing whenever the question involves current "
-        "facts, prices, posts or news. Chain tools when needed: e.g. search "
-        "the catalog, inspect an endpoint, then call it.\n\n"
+        "treg news search), Hacker News (free) and markets (stocks, "
+        "fundamentals, crypto). Use them instead of guessing whenever the "
+        "question involves current facts, prices, posts or news. Chain tools "
+        "when needed: e.g. search the catalog, inspect an endpoint, then call "
+        "it.\n\n"
         "Costs: treg_*, web_*, x_* and reddit_* calls are paid (usually "
         "fractions of a cent) and charged to the team; news_top/news_tech/"
-        "news_business and market_*/crypto_* are free. Prefer free tools when "
-        "they answer the question, and do not repeat an expensive call.\n\n"
+        "news_business, the hn_* tools and market_*/crypto_* are free. Prefer "
+        "free tools when they answer the question, and do not repeat an "
+        "expensive call.\n\n"
         "Style: answer in Markdown, concisely. Give numbers with units and "
         "cite the URLs you relied on. If a tool fails, say what failed and "
         "try a reasonable alternative; never invent data. If the question is "
@@ -803,6 +845,7 @@ def tool_summary() -> str:
         "x": "X (Twitter)",
         "reddit": "Reddit",
         "news": "News (free RSS + search)",
+        "hn": "Hacker News (free)",
         "market": "Markets (stocks)",
         "crypto": "Crypto",
     }

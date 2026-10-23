@@ -3,6 +3,11 @@
 Directions for the everything app — the gateway to the internet. Where treg's
 catalog already has coverage it's noted; the rest is to build.
 
+How a feature is built — the AI-centred rules (local endpoint only, every tab
+has an AI action, every data source is a tool, prefer free tools) — is in the
+README under **Doctrine — how features are added**. Anything listed here
+arrives as a tab plus its AI tools.
+
 ## Data & finance
 
 - **Reddit** — a frontend tab like the X tab: search, subreddit timelines,
@@ -19,13 +24,19 @@ catalog already has coverage it's noted; the rest is to build.
   *Done — the News tab is in the app: Top/Tech/Business aggregate free RSS
   feeds (deduped and ranked), Search goes through treg, Read article fetches
   the full text, and Digest summarizes with the local model (see README).*
+- **Hacker News** — a Hacker News frontend: Top/New/Best/Ask/Show/Jobs, search,
+  post detail and the comment tree, then an AI hand-off.
+  *Done — the Hacker News tab is in the app, backed by the free official API
+  and the free Algolia search API (no treg calls, no charges). **Comments**
+  loads the thread, **AI digest** summarizes the list, **Ask AI** explains the
+  selected story (see README).*
 - **AI over all of it** — an AI that can look at all of the above: reddit,
-  markets, news, financial data. *Done — the **AI** tab's model gets every
-  data source in the app as a tool: the treg catalog and any endpoint (async
-  included), web search/extract, X, Reddit, News (free RSS + treg search) and
-  Markets/crypto (yfinance), with native OpenAI tool calling and a JSON
-  fallback. See README.* The MCP-server idea below is still open, to expose
-  the same tools to any external MCP client.
+  markets, news, Hacker News, financial data. *Done — the **AI** tab's model
+  gets every data source in the app as a tool: the treg catalog and any
+  endpoint (async included), web search/extract, X, Reddit, News (free RSS +
+  treg search), Hacker News (free) and Markets/crypto (yfinance), with native
+  OpenAI tool calling and a JSON fallback. See README.* The MCP-server idea
+  below is still open, to expose the same tools to any external MCP client.
 
 ## More platform frontends
 

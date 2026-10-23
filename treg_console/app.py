@@ -27,6 +27,9 @@ Tabs:
   News     — a news front page: Top, Tech and Business aggregate free RSS
              feeds (deduped and ranked), Search goes through treg. Read the
              full article or hand the current stories to the AI
+  Hacker News — a Hacker News frontend: Top/New/Best/Ask/Show/Jobs from the
+             free official API, free Algolia search, free comment trees, and
+             an Ask AI / AI digest hand-off
 
 Credentials come from the treg CLI config (~/.treg/config.json) or TREG_TOKEN.
 The AI endpoint is OpenAI-compatible; configure it with AI_URL, AI_API_KEY
@@ -56,6 +59,10 @@ import httpx
 from .ai import (AI_MODEL, AI_URL, run_agent, tool_summary)
 from .client import TregClient, TregError, load_credentials, poll_async_task
 from .desktop import install_desktop_entry, remove_desktop_entry
+from .hackernews import (FEED_LABELS as HN_FEED_LABELS,
+                         comment_tree as hn_comment_tree,
+                         digest_prompt as hn_digest_prompt,
+                         feed as hn_feed, search as hn_search)
 from .markets import (MAJOR_COINS, yf_coins, yf_crypto_quote, yf_fundamentals,
                       yf_history, yf_quote)
 from .news import (TOPIC_LABELS as NEWS_TOPIC_LABELS, digest_prompt,
@@ -116,6 +123,10 @@ _M_MARKET_MODES = ("stock", "history", "fundamentals", "crypto")
 # News tab: topic views aggregate free RSS; "search" uses treg's routed
 # news search. The order matches the combo box.
 _NEWS_MODES = ("top", "tech", "business", "search")
+
+# Hacker News tab: the official free API's story lists via hackernews.py;
+# "search" uses the free Algolia API. The order matches the combo box.
+_HN_MODES = ("top", "new", "best", "ask", "show", "jobs", "search")
 
 
 def _m_price(v) -> str:
@@ -535,10 +546,11 @@ class Worker(threading.Thread):
 class MainWindow(Gtk.ApplicationWindow):
     AI_HINT = ("**AI interaction** — ask anything. I can use every data source "
                "in the app as a tool: the treg catalog and any endpoint, web "
-               "search and pages, X, Reddit, News and Markets.\n\n"
+               "search and pages, X, Reddit, News, Markets and Hacker News.\n\n"
                "Try: *“what's moving in the market today and why?”*, "
-               "*“summarize the top tech news”*, *“find an endpoint for "
-               "backlinks and call it for example.com”*.")
+               "*“summarize the top tech news”*, *“what's hot on Hacker News "
+               "right now?”*, *“find an endpoint for backlinks and call it for "
+               "example.com”*.")
 
     def __init__(self, application):
         super().__init__(application=application)
@@ -563,6 +575,9 @@ class MainWindow(Gtk.ApplicationWindow):
         self._news_items: list[dict] = []
         self._news_selected: dict | None = None
         self._news_label = "News"
+        self._hn_items: list[dict] = []
+        self._hn_selected: dict | None = None
+        self._hn_label = "Hacker News"
         self._md_links: dict[Gtk.TextView, list[tuple[int, int, str]]] = {}
         self._ai_messages: list[dict] = []
         self._ai_busy = False
@@ -618,6 +633,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.tabs.append_page(self._build_reddit_tab(), Gtk.Label(label="Reddit"))
         self.tabs.append_page(self._build_markets_tab(), Gtk.Label(label="Markets"))
         self.tabs.append_page(self._build_news_tab(), Gtk.Label(label="News"))
+        self.tabs.append_page(self._build_hn_tab(), Gtk.Label(label="Hacker News"))
         self.tabs.set_current_page(0)
         root.pack_start(self.tabs, True, True, 0)
 
@@ -1215,6 +1231,94 @@ class MainWindow(Gtk.ApplicationWindow):
             self.news_detail,
             "*Choose **Top**, **Tech**, **Business** or **Search**, then press "
             "**Go**. The topic views aggregate free feeds; search uses treg.*")
+        return w
+
+    def _build_hn_tab(self) -> Gtk.Widget:
+        """A Hacker News frontend: Top/New/Best/Ask/Show/Jobs come straight
+        from the free official API (no treg calls, no charges), Search uses
+        the free Algolia API, and the comment tree is free too. A story opens
+        on the right, where it can be read in full (treg web extract), handed
+        to the AI, or the whole list digested by the AI."""
+        w = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.hn_mode = Gtk.ComboBoxText()
+        for label in ("Top", "New", "Best", "Ask HN", "Show HN", "Jobs",
+                      "Search"):
+            self.hn_mode.append_text(label)
+        self.hn_mode.set_active(0)
+        self.hn_mode.connect("changed", self._hn_mode_changed)
+        self.hn_entry = Gtk.Entry()
+        self.hn_entry.set_placeholder_text("Top stories — no query needed")
+        self.hn_entry.set_sensitive(False)
+        self.hn_entry.connect("activate", lambda e: self._hn_go())
+        self.hn_limit = Gtk.SpinButton.new_with_range(5, 90, 5)
+        self.hn_limit.set_value(30)
+        self.hn_limit.set_size_request(64, -1)
+        self.hn_limit.set_tooltip_text("stories to show")
+        go = Gtk.Button(label="Go")
+        go.connect("clicked", lambda b: self._hn_go())
+        row.pack_start(self.hn_mode, False, False, 0)
+        row.pack_start(self.hn_entry, True, True, 0)
+        row.pack_start(self.hn_limit, False, False, 0)
+        row.pack_start(go, False, False, 0)
+        w.pack_start(row, False, False, 0)
+
+        paned = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL)
+
+        self.hn_store = Gtk.ListStore(str, str, str)
+        self.hn_table = Gtk.TreeView(model=self.hn_store)
+        for header, col_idx in (("Title", 0), ("Points", 1), ("Comments", 2)):
+            col = Gtk.TreeViewColumn(header, Gtk.CellRendererText(), text=col_idx)
+            if col_idx == 0:
+                col.set_expand(True)
+            self.hn_table.append_column(col)
+        self.hn_table.get_selection().connect(
+            "changed", lambda s: self._on_hn_selected())
+        paned.pack1(self._scrolled(self.hn_table), True, True)
+
+        self.hn_detail = self._textview()
+        self.hn_detail.connect("button-press-event", self._md_link_click)
+        paned.pack2(self._scrolled(self.hn_detail), True, True)
+        paned.set_position(620)
+        w.pack_start(paned, True, True, 0)
+
+        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.hn_read_btn = Gtk.Button(label="Read article")
+        self.hn_read_btn.set_tooltip_text(
+            "fetch the full article with treg's web extract")
+        self.hn_read_btn.set_sensitive(False)
+        self.hn_read_btn.connect("clicked", lambda b: self._hn_read())
+        self.hn_open_btn = Gtk.Button(label="Open link")
+        self.hn_open_btn.set_sensitive(False)
+        self.hn_open_btn.connect("clicked", lambda b: self._hn_open())
+        self.hn_comments_btn = Gtk.Button(label="Comments")
+        self.hn_comments_btn.set_tooltip_text(
+            "load the comment tree from the free Hacker News API")
+        self.hn_comments_btn.set_sensitive(False)
+        self.hn_comments_btn.connect("clicked", lambda b: self._hn_comments())
+        self.hn_digest_btn = Gtk.Button(label="AI digest")
+        self.hn_digest_btn.set_tooltip_text(
+            f"Summarize the current stories in the AI tab ({AI_MODEL})")
+        self.hn_digest_btn.set_sensitive(False)
+        self.hn_digest_btn.connect("clicked", lambda b: self._hn_digest())
+        self.hn_ask_btn = Gtk.Button(label="Ask AI")
+        self.hn_ask_btn.set_tooltip_text(
+            "Ask the AI about the selected story — it can read the link and "
+            "the HN discussion and look for more context")
+        self.hn_ask_btn.set_sensitive(False)
+        self.hn_ask_btn.connect("clicked", lambda b: self._hn_ask_ai())
+        btn_row.pack_start(self.hn_read_btn, False, False, 0)
+        btn_row.pack_start(self.hn_open_btn, False, False, 0)
+        btn_row.pack_start(self.hn_comments_btn, False, False, 0)
+        btn_row.pack_start(self.hn_digest_btn, False, False, 0)
+        btn_row.pack_start(self.hn_ask_btn, False, False, 0)
+        w.pack_start(btn_row, False, False, 0)
+        self._render_md(
+            self.hn_detail,
+            "*Pick **Top**, **New**, **Best**, **Ask HN**, **Show HN**, "
+            "**Jobs** or **Search**, then press **Go**. Everything here is "
+            "free — the official Hacker News API, no treg calls.*")
         return w
 
     # -- plumbing -------------------------------------------------------------
@@ -2982,6 +3086,263 @@ class MainWindow(Gtk.ApplicationWindow):
         self.news_digest_btn.set_sensitive(bool(self._news_items))
         self._render_md(self.news_detail, f"*(digest failed) {_esc(msg)}*")
         self._error(f"digest: {msg}")
+
+    # -- Hacker News tab -------------------------------------------------------
+
+    def _hn_mode(self) -> str:
+        idx = self.hn_mode.get_active()
+        return _HN_MODES[idx] if 0 <= idx < len(_HN_MODES) else "top"
+
+    def _hn_mode_changed(self, combo):
+        mode = self._hn_mode()
+        placeholders = {
+            "top": "Top stories — no query needed",
+            "new": "Newest submissions — no query needed",
+            "best": "Best stories — no query needed",
+            "ask": "Ask HN — no query needed",
+            "show": "Show HN — no query needed",
+            "jobs": "Jobs — no query needed",
+            "search": "search Hacker News — keyword or phrase…",
+        }
+        self.hn_entry.set_placeholder_text(placeholders.get(mode, ""))
+        self.hn_entry.set_sensitive(mode == "search")
+        if mode == "search":
+            self.hn_entry.grab_focus()
+        self._hn_items = []
+        self._hn_selected = None
+        self._hn_label = HN_FEED_LABELS.get(mode, "Hacker News")
+        self.hn_store.clear()
+        self.hn_read_btn.set_sensitive(False)
+        self.hn_open_btn.set_sensitive(False)
+        self.hn_comments_btn.set_sensitive(False)
+        self.hn_digest_btn.set_sensitive(False)
+        self.hn_ask_btn.set_sensitive(False)
+        hint = (f"*{self._hn_label} — press **Go** to load the stories.*"
+                if mode != "search" else
+                "*Type a query and press **Go** to search Hacker News "
+                "(free Algolia API).*")
+        self._render_md(self.hn_detail, hint)
+
+    def _hn_go(self):
+        mode = self._hn_mode()
+        limit = int(self.hn_limit.get_value())
+        if mode == "search":
+            q = self.hn_entry.get_text().strip()
+            if not q:
+                self._error("enter a query to search Hacker News")
+                return
+            self._busy(f"Searching Hacker News for “{q}”…")
+            self._spawn(hn_search, q, limit,
+                        on_ok=lambda out: self._hn_loaded(out, f"Search: {q}"),
+                        on_fail=lambda m: self._error(f"Hacker News search: {m}"))
+            return
+        label = HN_FEED_LABELS.get(mode, "Hacker News")
+        self._busy(f"Loading {label.lower()} from Hacker News…")
+        self._spawn(hn_feed, mode, limit,
+                    on_ok=lambda out: self._hn_loaded(out, label),
+                    on_fail=lambda m: self._error(f"Hacker News: {m}"))
+
+    def _hn_loaded(self, rows: list[dict], label: str):
+        self._hn_label = label
+        self._hn_items = rows or []
+        self._hn_selected = None
+        self.hn_store.clear()
+        for it in self._hn_items:
+            self.hn_store.append([
+                it.get("title") or "(untitled)",
+                _count(it.get("score")),
+                _count(it.get("comments")),
+            ])
+        self.hn_read_btn.set_sensitive(False)
+        self.hn_open_btn.set_sensitive(False)
+        self.hn_comments_btn.set_sensitive(False)
+        self.hn_digest_btn.set_sensitive(bool(self._hn_items))
+        self.hn_ask_btn.set_sensitive(False)
+        if not self._hn_items:
+            self._render_md(self.hn_detail,
+                            f"*{label} returned no stories — try again.*")
+            self._error(f"no Hacker News stories for {label}")
+            return
+        self._render_md(
+            self.hn_detail,
+            f"**{label}** — {len(self._hn_items)} stories\n\n"
+            "*Select a story for its details, **Read article** for the full "
+            "text (treg), **Comments** for the free discussion, **Ask AI** "
+            "about it, or **AI digest** to summarize the list.*")
+        self._busy(f"{len(self._hn_items)} stories · Hacker News (free)")
+
+    def _on_hn_selected(self):
+        model, treeiter = self.hn_table.get_selection().get_selected()
+        if treeiter is None:
+            return
+        idx = model.get_path(treeiter).get_indices()[0]
+        if idx >= len(self._hn_items):
+            return
+        self._hn_selected = self._hn_items[idx]
+        self._hn_render_detail()
+
+    def _hn_render_detail(self):
+        p = self._hn_selected
+        if not p:
+            return
+        lines = [f"**{p.get('title') or '(untitled)'}**", ""]
+        meta = [f"{p.get('score') or 0} points",
+                f"{p.get('comments') or 0} comments"]
+        if p.get("site"):
+            meta.append(p["site"])
+        if p.get("by"):
+            meta.append(f"by {p['by']}")
+        when = news_when(p.get("ts"))
+        if when:
+            meta.append(when)
+        lines.append(" · ".join(_esc(m) for m in meta))
+        if p.get("text"):
+            lines += ["", _esc(p["text"])]
+        links = [f"[Open the article]({p.get('url') or ''})"]
+        if p.get("hn_url"):
+            links.append(f"[Discuss on Hacker News]({p['hn_url']})")
+        lines += ["", " · ".join(links)]
+        self._render_md(self.hn_detail, "\n".join(lines))
+        self.hn_read_btn.set_sensitive(
+            bool(not p.get("self_post") and p.get("url")
+                 and self.client is not None))
+        self.hn_open_btn.set_sensitive(bool(p.get("url")))
+        self.hn_comments_btn.set_sensitive(bool(p.get("comments")))
+        self.hn_ask_btn.set_sensitive(True)
+
+    def _hn_read(self):
+        p = self._hn_selected
+        if not p or not p.get("url"):
+            return
+        if self.client is None:
+            self._error("reading an article needs a treg token — run `treg login`")
+            return
+        url = p["url"]
+        self.hn_read_btn.set_sensitive(False)
+        self._busy(f"Reading {url}…")
+        self._spawn(self.client.call, "treg.web.extract", "POST", None,
+                    json.dumps({"url": url}),
+                    on_ok=lambda r: self._hn_read_done(url, r),
+                    on_fail=self._hn_read_failed)
+
+    def _hn_read_failed(self, msg: str):
+        self.hn_read_btn.set_sensitive(True)
+        self._error(f"read: {msg}")
+
+    def _hn_read_done(self, url: str, r: httpx.Response):
+        self.hn_read_btn.set_sensitive(True)
+        try:
+            body = r.json()
+        except ValueError:
+            body = None
+        p = self._hn_selected or {}
+        head = f"# {p.get('title') or 'Article'}\n\n"
+        meta = [f"{p.get('score') or 0} points"]
+        if p.get("site"):
+            meta.append(p["site"])
+        when = news_when(p.get("ts"))
+        if when:
+            meta.append(when)
+        head += f"*{' · '.join(_esc(m) for m in meta)}*\n\n"
+        if r.status_code >= 400 or body is None:
+            detail = body.get("detail", "") if isinstance(body, dict) else ""
+            reason = _esc(detail) if detail else f"HTTP {r.status_code}"
+            self._render_md(self.hn_detail,
+                            head + f"*(could not read the article) {reason}*")
+            self._error(f"read: HTTP {r.status_code}")
+            return
+        bits = [url]
+        if r.headers.get("X-Treg-Served-By"):
+            bits.append(f"via {r.headers['X-Treg-Served-By']}")
+        if r.headers.get("X-Treg-Cost-Micro") is not None:
+            bits.append(f"charged {usd(int(r.headers['X-Treg-Cost-Micro']))}")
+        self._render_md(self.hn_detail, head + _page_markdown(body),
+                        base_url=url)
+        self._busy(" · ".join(bits))
+
+    def _hn_open(self):
+        p = self._hn_selected
+        if p and p.get("url"):
+            try:
+                Gio.AppInfo.launch_default_for_uri(p["url"], None)
+            except GLib.Error as e:
+                self._error(f"could not open {p['url']}: {e.message}")
+
+    def _hn_comments(self):
+        p = self._hn_selected
+        if not p or p.get("id") is None:
+            return
+        self.hn_comments_btn.set_sensitive(False)
+        self._busy(f"Loading comments for “{p.get('title', '')}”…")
+        self._spawn(hn_comment_tree, p["id"], 60,
+                    on_ok=lambda out: self._hn_comments_done(p, out),
+                    on_fail=self._hn_comments_failed)
+
+    def _hn_comments_failed(self, msg: str):
+        self.hn_comments_btn.set_sensitive(True)
+        self._error(f"comments: {msg}")
+
+    def _hn_comments_done(self, p: dict, out: dict):
+        self.hn_comments_btn.set_sensitive(True)
+        rows = out.get("comments") or []
+        total = out.get("total") or len(rows)
+        lines = [f"**{p.get('title') or 'Story'}**", "",
+                 f"*Comments — {len(rows)} of {total} loaded (free Hacker News API)*",
+                 ""]
+        if not rows:
+            lines.append("*(no comments yet)*")
+        for c in rows:
+            depth = min(int(c.get("depth") or 0), 8)
+            head = ("↳ " * depth) + f"**{_esc(c.get('by') or '?')}**"
+            when = news_when(c.get("ts"))
+            if when:
+                head += f"  ({_esc(when)})"
+            lines.append(head)
+            for ln in (c.get("text") or "").splitlines():
+                lines.append(("↳ " * depth) + _esc(ln))
+            lines.append("")
+        self._render_md(self.hn_detail, "\n".join(lines))
+        self._busy(f"{len(rows)} comments · Hacker News (free)")
+
+    def _hn_digest(self):
+        rows = self._hn_items
+        if not rows:
+            self._error("load some stories first, then press AI digest")
+            return
+        n = min(len(rows), 12)
+        self._ai_ask(
+            f"Write a digest of the {n} current Hacker News {self._hn_label} "
+            "stories below. You can call the Hacker News tools for anything "
+            "more recent.",
+            hn_digest_prompt(self._hn_label, rows),
+            display=f"Write a digest of the current Hacker News "
+                    f"{self._hn_label} stories.")
+        self._busy(f"AI is digesting {n} Hacker News stories…")
+
+    def _hn_ask_ai(self):
+        p = self._hn_selected
+        if not p:
+            self._error("select a story first")
+            return
+        context = (
+            "Hacker News story:\n"
+            f"Title: {p.get('title', '')}\n"
+            f"Points: {p.get('score') or 0}\n"
+            f"Comments: {p.get('comments') or 0}\n"
+            f"Author: {p.get('by') or ''}\n"
+            f"Site: {p.get('site') or ''}\n"
+            f"Posted: {news_when(p.get('ts')) or ''}\n"
+            f"URL: {p.get('url') or ''}\n"
+            f"HN discussion: {p.get('hn_url') or ''}\n"
+            f"Text: {p.get('text') or ''}"
+        )
+        self._ai_ask(
+            "Explain this Hacker News story: what it is, why the tech "
+            "community is interested, the key technical claims, and the state "
+            "of the discussion. Read the link and the HN thread if it helps, "
+            "and pull related news, coverage or market context when relevant.",
+            context,
+            display=f"Explain this Hacker News story: {p.get('title', '')}")
 
     # -- shutdown --------------------------------------------------------------------
 

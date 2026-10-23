@@ -2,23 +2,62 @@
 
 A native Linux desktop app (GTK3) that uses [treg](https://treg.to) as its
 backend. The simple path is the **Browse** tab: search the web, click a
-result, and read the page. Under the hood it's a full console — X (Twitter)
-and Reddit frontends, a news front page, market data, a 4,000+ endpoint
-catalog, live calls with cost, and an **AI** tab whose model can call all of
-it as tools.
+result, and read the page. Under the hood it's a full console — X (Twitter),
+Reddit and Hacker News frontends, a news front page, market data, a 4,000+
+endpoint catalog, live calls with cost, and an **AI** tab whose model can
+call all of it as tools.
 
 ## The goal
 
 The treg console is meant to become the **everything app** — one native
 window that is your gateway to the internet: search the web and read pages,
-browse social platforms (X and Reddit today, more as treg's catalog grows),
-read the news, watch markets, and call any of treg's 4,000+ endpoints — all
-with live cost, without leaving the desktop. An **AI interaction** tab ties
-it together: the local model can use every one of those data sources as a
-tool, so one question can search the catalog, read a page, scan news and
-check markets in a single turn. treg's catalog (113 platforms, new providers
-all the time) is the backend that makes this possible: every platform or
-service treg can reach is a frontend this app can add next.
+browse social platforms (X, Reddit and Hacker News today, more as treg's
+catalog grows), read the news, watch markets, and call any of treg's 4,000+
+endpoints — all with live cost, without leaving the desktop. An **AI
+interaction** tab ties it together: the local model can use every one of
+those data sources as a tool, so one question can search the catalog, read a
+page, scan news, check markets and skim Hacker News in a single turn. treg's
+catalog (113 platforms, new providers all the time) is the backend that makes
+this possible: every platform or service treg can reach is a frontend this
+app can add next.
+
+## Doctrine — how features are added
+
+This app is **AI-centred**. The AI is not a bolt-on: it is the intended
+primary way to use the app. Every screen also exists as a tool, so the model
+can do by itself whatever you can do by clicking. Keep that true for anything
+you add.
+
+1. **The AI is local.** The model is an OpenAI-compatible server on your own
+   machine — `AI_URL` (default `http://localhost:5000/v1`), `AI_API_KEY`,
+   `TREG_AI_MODEL`. New features must work against that local endpoint; do
+   not make part of the app depend on a hosted model, and do not send the
+   user's data off-box. The point is that it runs on your hardware.
+2. **Every tab has at least one AI feature.** A new tab is not finished until
+   it can hand off to the AI. At minimum an **Ask AI** action that explains
+   the current selection with the on-screen context; when the tab shows a list
+   or a result set, also an **AI digest** / analysis action for the whole
+   view (see the News and Hacker News tabs). Wire it through
+   `MainWindow._ai_ask(...)` so the turn lands in the AI tab.
+3. **Every data source is a tool.** Whatever the app can fetch, the model must
+   be able to fetch. Add it to the tool registry in `ai.py`
+   (`build_registry`), give it a clear description that says whether it is
+   free or paid, add it to the `tool_summary` groups, and mention it in
+   `system_prompt()`. A data source that the AI cannot reach is an
+   incomplete feature.
+4. **Prefer free tools; be honest about cost.** Free, direct sources (RSS,
+   the official Hacker News API, yfinance) come first; treg-routed calls are
+   paid. Descriptions and the system prompt must say which is which, and the
+   UI must show charges in the status bar. Never hide a cost.
+5. **Pass context, don't re-fetch.** When a tab hands off to the AI it should
+   include the rows and detail that are already on screen (as hidden context),
+   so the model reasons about the current view. It may then call tools for
+   anything more recent or missing.
+6. **Keep the tool surface coherent.** Name tools by area with a shared prefix
+   (`news_*`, `hn_*`, `market_*`, `crypto_*`, `x_*`, `reddit_*`, `treg_*`),
+   return plain JSON-able dicts (the registry truncates oversized results),
+   raise `TregError` for expected failures, and stay synchronous/blocking —
+   the GUI always calls these from a worker thread.
 
 
 ## Native look
@@ -102,8 +141,10 @@ treg-console --no-desktop           # start without touching it
   catalog and call *any* endpoint (`treg_call`, async tasks polled), search
   the web and read pages, search X and load replies/profiles, search Reddit
   and load comments/profiles, read the news (free RSS) or search it through
-  treg, and pull stock quotes, history, fundamentals and crypto from
-  yfinance. Tool calls appear inline (`→ tool_name(...)` / `← result`) and
+  treg, read Hacker News from its free official API (`hn_stories`,
+  `hn_search`, `hn_item`, `hn_comments`), and pull stock quotes, history,
+  fundamentals and crypto from yfinance. Tool calls appear inline
+  (`→ tool_name(...)` / `← result`) and
   answers render as Markdown with clickable links; the conversation is kept
   for follow-ups until **New chat**. Native OpenAI tool calling is used when
   the server supports it, otherwise the agent falls back to a fenced-JSON
@@ -162,6 +203,18 @@ treg-console --no-desktop           # start without touching it
   **Read article** fetches the full text with treg's web extract, **Open in
   browser** hands it to the desktop, **AI digest** summarizes the current
   list in the AI tab, and **Ask AI** explains the selected story.
+- **Hacker News** — a Hacker News frontend backed by the **free official
+  API** (`hacker-news.firebaseio.com`) and the **free Algolia search API** —
+  no treg calls, no charges, works without a token. Seven modes: **Top**,
+  **New**, **Best**, **Ask HN**, **Show HN**, **Jobs**, and **Search** (the
+  free Algolia index). Select a story for its points, author, site and text,
+  **Read article** fetches the linked page with treg's web extract, **Open
+  link** hands it to the desktop, **Comments** loads the discussion as a
+  nested tree from the free API, **AI digest** summarizes the current list in
+  the AI tab, and **Ask AI** explains the selected story and its thread.
+
+Every tab carries at least one AI action — that is the app's doctrine; see
+**Doctrine — how features are added**.
 
 ## Credentials
 
@@ -179,12 +232,14 @@ pyproject.toml         meson-python build config (pip install .)
 data/                  .desktop entry + launcher script
 treg_console/
   app.py               the GUI (tabs, worker threads, charts, AI tab wiring)
-  ai.py                AI agent: tool registry (treg/web/X/Reddit/news/markets)
-                       and the native + fallback tool-calling loop
+  ai.py                AI agent: tool registry (treg/web/X/Reddit/news/HN/
+                       markets) and the native + fallback tool-calling loop
   client.py            synchronous REST client for the treg API + async polling
   parsing.py           response normalization shared by the tabs and the tools
   markets.py           yfinance data source for the Markets tab and AI tools
   news.py              RSS aggregation, dedupe/ranking and treg search for News
+  hackernews.py        Hacker News source (official API + Algolia) for the
+                       Hacker News tab and the AI tools
   desktop.py           .desktop + icon installation (user XDG dirs)
   icon.png             app icon
 ```

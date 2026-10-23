@@ -44,6 +44,15 @@ class RegistryTest(unittest.TestCase):
                          "treg_call", "x_search_posts", "reddit_search_posts"):
             self.assertIn(expected, names)
 
+    def test_built_registry_covers_hacker_news(self):
+        reg = ai.build_registry(None)
+        names = set(reg.names())
+        for expected in ("hn_stories", "hn_search", "hn_item", "hn_comments"):
+            self.assertIn(expected, names)
+
+    def test_tool_summary_lists_hacker_news(self):
+        self.assertIn("Hacker News", ai.tool_summary())
+
 
 class ParseActionTest(unittest.TestCase):
     def test_fenced_json_action(self):
