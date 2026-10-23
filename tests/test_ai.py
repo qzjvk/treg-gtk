@@ -50,8 +50,17 @@ class RegistryTest(unittest.TestCase):
         for expected in ("hn_stories", "hn_search", "hn_item", "hn_comments"):
             self.assertIn(expected, names)
 
-    def test_tool_summary_lists_hacker_news(self):
-        self.assertIn("Hacker News", ai.tool_summary())
+    def test_built_registry_covers_github(self):
+        reg = ai.build_registry(None)
+        names = set(reg.names())
+        for expected in ("github_search_repos", "github_trending",
+                         "github_repo", "github_issues", "github_releases"):
+            self.assertIn(expected, names)
+
+    def test_tool_summary_lists_hacker_news_and_github(self):
+        summary = ai.tool_summary()
+        self.assertIn("Hacker News", summary)
+        self.assertIn("GitHub", summary)
 
 
 class ParseActionTest(unittest.TestCase):

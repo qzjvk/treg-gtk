@@ -3,9 +3,10 @@
 One OpenAI-compatible chat endpoint (the same local server the old Summarize
 tab used) becomes an agent with tools: the treg catalog (every endpoint,
 `treg_call` for anything), web search/extract, X, Reddit, News (RSS + treg
-search), Hacker News (free official API) and Markets (yfinance). Native
-OpenAI tool calling is used when the server supports it; otherwise the agent
-falls back to a fenced-JSON tool protocol in plain chat.
+search), Hacker News (free official API), GitHub (free public API) and
+Markets (yfinance). Native OpenAI tool calling is used when the server
+supports it; otherwise the agent falls back to a fenced-JSON tool protocol in
+plain chat.
 
 All functions here are synchronous and blocking — call them from a worker
 thread, never from the GUI thread.
@@ -33,6 +34,9 @@ from typing import Any, Callable
 import httpx
 
 from .client import TregClient, TregError, poll_async_task
+from .github import (issues as gh_issues, releases as gh_releases,
+                     repo as gh_repo, search_repos as gh_search,
+                     trending as gh_trending)
 from .hackernews import (comment_tree as hn_comment_tree, feed as hn_feed,
                          item_view as hn_item_view, search as hn_search)
 from .markets import (MAJOR_COINS, yf_coins, yf_crypto_quote, yf_fundamentals,
@@ -540,6 +544,56 @@ def build_registry(client: TregClient | None,
         "per comment (indented replies). Free.",
         {"item_id": _INT, "limit": _INT}, ["item_id"], hn_comments)
 
+    # -- GitHub (free, public API) -----------------------------------------
+
+    def gh_search_tool(a: dict) -> object:
+        return gh_search(str(a["query"]), int(a.get("limit") or 20),
+                         str(a.get("sort") or "stars"))
+
+    def gh_trending_tool(a: dict) -> object:
+        return gh_trending(int(a.get("days") or 7), int(a.get("limit") or 20))
+
+    def gh_repo_tool(a: dict) -> object:
+        return gh_repo(str(a["repo"]))
+
+    def gh_issues_tool(a: dict) -> object:
+        return gh_issues(str(a["repo"]), int(a.get("limit") or 20),
+                         str(a.get("state") or "open"))
+
+    def gh_releases_tool(a: dict) -> object:
+        return gh_releases(str(a["repo"]), int(a.get("limit") or 20))
+
+    reg.add(
+        "github_search_repos",
+        "Search GitHub repositories by keyword, returning owner/name, "
+        "description, stars, forks, language and topics. Free; set "
+        "GITHUB_TOKEN for a higher rate limit.",
+        {"query": _STR, "limit": _INT,
+         "sort": {"type": "string",
+                  "enum": ["stars", "forks", "updated", "help-wanted-issues"]}},
+        ["query"], gh_search_tool)
+    reg.add(
+        "github_trending",
+        "Recently created GitHub repositories sorted by stars — the closest "
+        "the free API gets to a trending page. Free.",
+        {"days": _INT, "limit": _INT}, [], gh_trending_tool)
+    reg.add(
+        "github_repo",
+        "One GitHub repository by owner/name or URL, with stats, topics, "
+        "license and its README as Markdown. Free.",
+        {"repo": _STR}, ["repo"], gh_repo_tool)
+    reg.add(
+        "github_issues",
+        "Open/closed issues and pull requests of a GitHub repo, newest "
+        "activity first (labels, author, comment count, body). Free.",
+        {"repo": _STR, "limit": _INT,
+         "state": {"type": "string", "enum": ["open", "closed", "all"]}},
+        ["repo"], gh_issues_tool)
+    reg.add(
+        "github_releases",
+        "A GitHub repo's releases, newest first (tag, name, author, notes). "
+        "Free.", {"repo": _STR, "limit": _INT}, ["repo"], gh_releases_tool)
+
     # -- Markets (yfinance, free) ------------------------------------------
 
     def market_quote(a: dict) -> object:
@@ -620,16 +674,16 @@ def system_prompt() -> str:
         f"Today is {today}.\n\n"
         "You have tools for the treg catalog (thousands of API endpoints), "
         "web search and page reading, X/Twitter, Reddit, news (free RSS and "
-        "treg news search), Hacker News (free) and markets (stocks, "
-        "fundamentals, crypto). Use them instead of guessing whenever the "
-        "question involves current facts, prices, posts or news. Chain tools "
-        "when needed: e.g. search the catalog, inspect an endpoint, then call "
-        "it.\n\n"
+        "treg news search), Hacker News (free), GitHub (free) and markets "
+        "(stocks, fundamentals, crypto). Use them instead of guessing whenever "
+        "the question involves current facts, prices, code, posts or news. "
+        "Chain tools when needed: e.g. search the catalog, inspect an "
+        "endpoint, then call it.\n\n"
         "Costs: treg_*, web_*, x_* and reddit_* calls are paid (usually "
         "fractions of a cent) and charged to the team; news_top/news_tech/"
-        "news_business, the hn_* tools and market_*/crypto_* are free. Prefer "
-        "free tools when they answer the question, and do not repeat an "
-        "expensive call.\n\n"
+        "news_business, the hn_* and github_* tools and market_*/crypto_* are "
+        "free. Prefer free tools when they answer the question, and do not "
+        "repeat an expensive call.\n\n"
         "Style: answer in Markdown, concisely. Give numbers with units and "
         "cite the URLs you relied on. If a tool fails, say what failed and "
         "try a reasonable alternative; never invent data. If the question is "
@@ -846,6 +900,7 @@ def tool_summary() -> str:
         "reddit": "Reddit",
         "news": "News (free RSS + search)",
         "hn": "Hacker News (free)",
+        "github": "GitHub (free)",
         "market": "Markets (stocks)",
         "crypto": "Crypto",
     }

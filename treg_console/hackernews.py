@@ -25,7 +25,7 @@ import httpx
 from .client import TregError
 from .news import parse_time, relative_time
 
-UA = "treg-console/1.3 (+https://treg.to)"
+UA = "treg-console/1.4 (+https://treg.to)"
 TIMEOUT = 15.0
 MAX_FETCH = 90  # at most this many items in one list view
 BASE = "https://hacker-news.firebaseio.com/v0"

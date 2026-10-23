@@ -3,20 +3,23 @@
 A native Linux desktop app (GTK3) that uses [treg](https://treg.to) as its
 backend. The simple path is the **Browse** tab: search the web, click a
 result, and read the page. Under the hood it's a full console — X (Twitter),
-Reddit and Hacker News frontends, a news front page, market data, a 4,000+
-endpoint catalog, live calls with cost, and an **AI** tab whose model can
-call all of it as tools.
+Reddit, Hacker News and GitHub frontends, a news front page, market data, a
+4,000+ endpoint catalog, live calls with cost, and an **AI** tab whose model
+can call all of it as tools. **Ctrl+K** opens a command palette that jumps to
+any tab, searches a source, or hands the query straight to the AI.
 
 ## The goal
 
 The treg console is meant to become the **everything app** — one native
 window that is your gateway to the internet: search the web and read pages,
-browse social platforms (X, Reddit and Hacker News today, more as treg's
-catalog grows), read the news, watch markets, and call any of treg's 4,000+
-endpoints — all with live cost, without leaving the desktop. An **AI
-interaction** tab ties it together: the local model can use every one of
+browse social platforms and code (X, Reddit, Hacker News and GitHub today,
+more as treg's catalog grows), read the news, watch markets, and call any of
+treg's 4,000+ endpoints — all with live cost, without leaving the desktop. An
+**AI interaction** tab ties it together: the local model can use every one of
 those data sources as a tool, so one question can search the catalog, read a
-page, scan news, check markets and skim Hacker News in a single turn. treg's
+page, scan news, check markets, skim Hacker News and compare GitHub repos in a
+single turn. A **Ctrl+K** palette makes that the front door: type a question,
+a search or a repo name and it routes to the right tab or to the AI. treg's
 catalog (113 platforms, new providers all the time) is the backend that makes
 this possible: every platform or service treg can reach is a frontend this
 app can add next.
@@ -78,6 +81,8 @@ desktop environment shows the right icon and groups the window with the app.
 - an OpenAI-compatible chat server for the AI tab (default
   `http://localhost:5000/v1`; native tool calling is used when the server
   supports it)
+- optional `GITHUB_TOKEN` for the GitHub tab — the public API works without
+  one (60 requests/hour); a token raises that to 5,000/hour
 
 ## Run from a checkout
 
@@ -142,7 +147,8 @@ treg-console --no-desktop           # start without touching it
   the web and read pages, search X and load replies/profiles, search Reddit
   and load comments/profiles, read the news (free RSS) or search it through
   treg, read Hacker News from its free official API (`hn_stories`,
-  `hn_search`, `hn_item`, `hn_comments`), and pull stock quotes, history,
+  `hn_search`, `hn_item`, `hn_comments`), search GitHub and read repos,
+  READMEs, issues and releases (`github_*`), and pull stock quotes, history,
   fundamentals and crypto from yfinance. Tool calls appear inline
   (`→ tool_name(...)` / `← result`) and
   answers render as Markdown with clickable links; the conversation is kept
@@ -212,6 +218,19 @@ treg-console --no-desktop           # start without touching it
   link** hands it to the desktop, **Comments** loads the discussion as a
   nested tree from the free API, **AI digest** summarizes the current list in
   the AI tab, and **Ask AI** explains the selected story and its thread.
+- **GitHub** — a GitHub frontend backed by the **free public API** — no treg
+  calls, no charges, works without a token (export `GITHUB_TOKEN` to lift the
+  anonymous 60/hour rate limit to 5,000/hour). Five modes: **Search**
+  repositories, **Trending** (repos created in the last 7 days, by stars),
+  **Repo** (stats, topics, license and the README rendered as Markdown),
+  **Issues** (open issues *and* pull requests, with labels, author, comments
+  and body) and **Releases** (tag, author, notes). Select a row for detail,
+  **Open on GitHub** in the browser, **AI digest** summarizes the current
+  list, and **Ask AI** explains the selected repo or issue.
+- **Ctrl+K** — the command palette. One box to jump to any tab, search the
+  web/catalog/news/Hacker News/GitHub, open a repo by `owner/name`, look up a
+  ticker, or **Ask AI** the query. Arrow keys move, Enter runs, Escape closes.
+  It is also a **Search / ask** button in the top bar.
 
 Every tab carries at least one AI action — that is the app's doctrine; see
 **Doctrine — how features are added**.
@@ -240,11 +259,14 @@ treg_console/
   news.py              RSS aggregation, dedupe/ranking and treg search for News
   hackernews.py        Hacker News source (official API + Algolia) for the
                        Hacker News tab and the AI tools
+  github.py            GitHub public API source (repos, trending, issues,
+                       releases) for the GitHub tab and the AI tools
   desktop.py           .desktop + icon installation (user XDG dirs)
   icon.png             app icon
 ```
 
-Tests for the News feed parsing/ranking and the AI agent live in `tests/`:
+Tests for the feed/API normalization (News, Hacker News, GitHub) and the AI
+agent live in `tests/`:
 
 ```sh
 python3 -m unittest discover -s tests -v

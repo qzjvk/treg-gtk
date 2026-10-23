@@ -30,6 +30,11 @@ Tabs:
   Hacker News — a Hacker News frontend: Top/New/Best/Ask/Show/Jobs from the
              free official API, free Algolia search, free comment trees, and
              an Ask AI / AI digest hand-off
+  GitHub   — a GitHub frontend: repository search, trending, repo detail with
+             README, issues/PRs and releases via the free public API, with
+             Ask AI / AI digest
+  Ctrl+K   — a command palette that jumps to any tab, searches a source, or
+             hands the query to the AI
 
 Credentials come from the treg CLI config (~/.treg/config.json) or TREG_TOKEN.
 The AI endpoint is OpenAI-compatible; configure it with AI_URL, AI_API_KEY
@@ -59,6 +64,10 @@ import httpx
 from .ai import (AI_MODEL, AI_URL, run_agent, tool_summary)
 from .client import TregClient, TregError, load_credentials, poll_async_task
 from .desktop import install_desktop_entry, remove_desktop_entry
+from .github import (digest_prompt as gh_digest_prompt,
+                     issues as gh_issues, releases as gh_releases,
+                     repo as gh_repo, repo_slug as gh_repo_slug,
+                     search_repos as gh_search, trending as gh_trending)
 from .hackernews import (FEED_LABELS as HN_FEED_LABELS,
                          comment_tree as hn_comment_tree,
                          digest_prompt as hn_digest_prompt,
@@ -127,6 +136,10 @@ _NEWS_MODES = ("top", "tech", "business", "search")
 # Hacker News tab: the official free API's story lists via hackernews.py;
 # "search" uses the free Algolia API. The order matches the combo box.
 _HN_MODES = ("top", "new", "best", "ask", "show", "jobs", "search")
+
+# GitHub tab: repositories, trending and issues/releases via github.py.
+# The order matches the combo box.
+_GH_MODES = ("search", "trending", "repo", "issues", "releases")
 
 
 def _m_price(v) -> str:
@@ -546,10 +559,12 @@ class Worker(threading.Thread):
 class MainWindow(Gtk.ApplicationWindow):
     AI_HINT = ("**AI interaction** — ask anything. I can use every data source "
                "in the app as a tool: the treg catalog and any endpoint, web "
-               "search and pages, X, Reddit, News, Markets and Hacker News.\n\n"
+               "search and pages, X, Reddit, News, Markets, Hacker News and "
+               "GitHub.\n\n"
                "Try: *“what's moving in the market today and why?”*, "
                "*“summarize the top tech news”*, *“what's hot on Hacker News "
-               "right now?”*, *“find an endpoint for backlinks and call it for "
+               "right now?”*, *“compare Rust web frameworks on GitHub”*, "
+               "*“find an endpoint for backlinks and call it for "
                "example.com”*.")
 
     def __init__(self, application):
@@ -578,11 +593,18 @@ class MainWindow(Gtk.ApplicationWindow):
         self._hn_items: list[dict] = []
         self._hn_selected: dict | None = None
         self._hn_label = "Hacker News"
+        self._gh_items: list[dict] = []
+        self._gh_selected: dict | None = None
+        self._gh_label = "GitHub"
+        self._gh_readme = ""
+        self._palette: Gtk.Dialog | None = None
+        self._palette_rows: list[tuple[str, str, str, object]] = []
         self._md_links: dict[Gtk.TextView, list[tuple[int, int, str]]] = {}
         self._ai_messages: list[dict] = []
         self._ai_busy = False
 
         self._build_ui()
+        self.connect("key-press-event", self._on_window_key)
         self.connect("destroy", self._on_destroy)
 
         if self.client is None:
@@ -611,6 +633,12 @@ class MainWindow(Gtk.ApplicationWindow):
         title = Gtk.Label()
         title.set_markup("<b>treg console</b>")
         top.pack_start(title, False, False, 0)
+        palette_btn = Gtk.Button(label="Search / ask…  Ctrl+K")
+        palette_btn.set_tooltip_text(
+            "Command palette: jump to a tab, search a source, or ask the AI "
+            "(Ctrl+K)")
+        palette_btn.connect("clicked", lambda b: self._open_palette())
+        top.pack_start(palette_btn, False, False, 0)
         self.team_label = Gtk.Label(label="team: …")
         self.balance_label = Gtk.Label()
         self.balance_label.set_markup("<b>balance: …</b>")
@@ -634,6 +662,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.tabs.append_page(self._build_markets_tab(), Gtk.Label(label="Markets"))
         self.tabs.append_page(self._build_news_tab(), Gtk.Label(label="News"))
         self.tabs.append_page(self._build_hn_tab(), Gtk.Label(label="Hacker News"))
+        self.tabs.append_page(self._build_gh_tab(), Gtk.Label(label="GitHub"))
         self.tabs.set_current_page(0)
         root.pack_start(self.tabs, True, True, 0)
 
@@ -1319,6 +1348,81 @@ class MainWindow(Gtk.ApplicationWindow):
             "*Pick **Top**, **New**, **Best**, **Ask HN**, **Show HN**, "
             "**Jobs** or **Search**, then press **Go**. Everything here is "
             "free — the official Hacker News API, no treg calls.*")
+        return w
+
+    def _build_gh_tab(self) -> Gtk.Widget:
+        """A GitHub frontend backed by the free public API: repository
+        search, trending (recent repos by stars), repo detail with README,
+        issues/PRs and releases. No treg calls, no charges. Set GITHUB_TOKEN
+        to lift the anonymous rate limit. Ask AI / AI digest hand the current
+        view to the AI tab."""
+        w = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.gh_mode = Gtk.ComboBoxText()
+        for label in ("Search", "Trending", "Repo", "Issues", "Releases"):
+            self.gh_mode.append_text(label)
+        self.gh_mode.set_active(0)
+        self.gh_mode.connect("changed", self._gh_mode_changed)
+        self.gh_entry = Gtk.Entry()
+        self.gh_entry.set_placeholder_text(
+            "search repositories — e.g. “static site generator”")
+        self.gh_entry.connect("activate", lambda e: self._gh_go())
+        self.gh_limit = Gtk.SpinButton.new_with_range(5, 100, 5)
+        self.gh_limit.set_value(25)
+        self.gh_limit.set_size_request(64, -1)
+        self.gh_limit.set_tooltip_text("rows to show")
+        go = Gtk.Button(label="Go")
+        go.connect("clicked", lambda b: self._gh_go())
+        row.pack_start(self.gh_mode, False, False, 0)
+        row.pack_start(self.gh_entry, True, True, 0)
+        row.pack_start(self.gh_limit, False, False, 0)
+        row.pack_start(go, False, False, 0)
+        w.pack_start(row, False, False, 0)
+
+        paned = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL)
+
+        self.gh_store = Gtk.ListStore(str, str)
+        self.gh_table = Gtk.TreeView(model=self.gh_store)
+        for header, col_idx in (("Repository / issue", 0), ("Details", 1)):
+            col = Gtk.TreeViewColumn(header, Gtk.CellRendererText(), text=col_idx)
+            if col_idx == 0:
+                col.set_expand(True)
+            self.gh_table.append_column(col)
+        self.gh_table.get_selection().connect(
+            "changed", lambda s: self._on_gh_selected())
+        paned.pack1(self._scrolled(self.gh_table), True, True)
+
+        self.gh_detail = self._textview()
+        self.gh_detail.connect("button-press-event", self._md_link_click)
+        paned.pack2(self._scrolled(self.gh_detail), True, True)
+        paned.set_position(620)
+        w.pack_start(paned, True, True, 0)
+
+        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.gh_open_btn = Gtk.Button(label="Open on GitHub")
+        self.gh_open_btn.set_sensitive(False)
+        self.gh_open_btn.connect("clicked", lambda b: self._gh_open())
+        self.gh_digest_btn = Gtk.Button(label="AI digest")
+        self.gh_digest_btn.set_tooltip_text(
+            f"Summarize the current results in the AI tab ({AI_MODEL})")
+        self.gh_digest_btn.set_sensitive(False)
+        self.gh_digest_btn.connect("clicked", lambda b: self._gh_digest())
+        self.gh_ask_btn = Gtk.Button(label="Ask AI")
+        self.gh_ask_btn.set_tooltip_text(
+            "Ask the AI about the selected repo or issue — it can read the "
+            "README and issues and look for more context")
+        self.gh_ask_btn.set_sensitive(False)
+        self.gh_ask_btn.connect("clicked", lambda b: self._gh_ask_ai())
+        btn_row.pack_start(self.gh_open_btn, False, False, 0)
+        btn_row.pack_start(self.gh_digest_btn, False, False, 0)
+        btn_row.pack_start(self.gh_ask_btn, False, False, 0)
+        w.pack_start(btn_row, False, False, 0)
+        self._render_md(
+            self.gh_detail,
+            "*Search repositories, load **Trending**, or enter a repo as "
+            "**owner/name** for **Repo**, **Issues** or **Releases**. Free — "
+            "the GitHub public API, no treg calls.*")
         return w
 
     # -- plumbing -------------------------------------------------------------
@@ -3343,6 +3447,384 @@ class MainWindow(Gtk.ApplicationWindow):
             "and pull related news, coverage or market context when relevant.",
             context,
             display=f"Explain this Hacker News story: {p.get('title', '')}")
+
+    # -- GitHub tab ------------------------------------------------------------
+
+    def _gh_mode(self) -> str:
+        idx = self.gh_mode.get_active()
+        return _GH_MODES[idx] if 0 <= idx < len(_GH_MODES) else "search"
+
+    def _gh_mode_changed(self, combo):
+        mode = self._gh_mode()
+        placeholders = {
+            "search": "search repositories — e.g. “static site generator”",
+            "trending": "no query needed — recent repos by stars (last 7 days)",
+            "repo": "owner/name or a github.com URL",
+            "issues": "owner/name — open issues and pull requests",
+            "releases": "owner/name — releases",
+        }
+        self.gh_entry.set_placeholder_text(placeholders.get(mode, ""))
+        self.gh_entry.set_sensitive(mode != "trending")
+        if mode != "trending":
+            self.gh_entry.grab_focus()
+        self._gh_items = []
+        self._gh_selected = None
+        self._gh_readme = ""
+        self._gh_label = {"trending": "Trending · last 7 days"}.get(
+            mode, "GitHub")
+        self.gh_store.clear()
+        self.gh_open_btn.set_sensitive(False)
+        self.gh_digest_btn.set_sensitive(False)
+        self.gh_ask_btn.set_sensitive(False)
+        hint = {
+            "trending": "*Press **Go** for the repos created in the last 7 "
+                        "days, ranked by stars.*",
+            "search": "*Type a query and press **Go** to search repositories.*",
+            "repo": "*Enter **owner/name** (or a github.com URL) and press "
+                    "**Go** for the README and stats.*",
+            "issues": "*Enter **owner/name** and press **Go** for open issues "
+                      "and pull requests.*",
+            "releases": "*Enter **owner/name** and press **Go** for releases.*",
+        }.get(mode, "")
+        self._render_md(self.gh_detail, hint)
+
+    def _gh_go(self):
+        mode = self._gh_mode()
+        limit = int(self.gh_limit.get_value())
+        if mode == "trending":
+            self._busy("Loading trending repositories…")
+            self._spawn(gh_trending, 7, limit,
+                        on_ok=lambda out: self._gh_loaded(
+                            out, "Trending · last 7 days"),
+                        on_fail=lambda m: self._error(f"GitHub: {m}"))
+            return
+        q = self.gh_entry.get_text().strip()
+        if not q:
+            self._error("enter a search query or a repo as owner/name")
+            return
+        if mode == "repo":
+            self._busy(f"Loading {q}…")
+            self._spawn(gh_repo, q, on_ok=self._gh_repo_loaded,
+                        on_fail=lambda m: self._error(f"GitHub: {m}"))
+            return
+        if mode == "search":
+            self._busy(f"Searching GitHub for “{q}”…")
+            self._spawn(gh_search, q, limit,
+                        on_ok=lambda out: self._gh_loaded(out, f"Search: {q}"),
+                        on_fail=lambda m: self._error(f"GitHub: {m}"))
+            return
+        if mode == "issues":
+            self._busy(f"Loading issues for {q}…")
+            self._spawn(gh_issues, q, limit,
+                        on_ok=lambda out: self._gh_loaded(
+                            out, f"Issues: {q}"),
+                        on_fail=lambda m: self._error(f"GitHub: {m}"))
+            return
+        self._busy(f"Loading releases for {q}…")
+        self._spawn(gh_releases, q, limit,
+                    on_ok=lambda out: self._gh_loaded(out, f"Releases: {q}"),
+                    on_fail=lambda m: self._error(f"GitHub: {m}"))
+
+    def _gh_loaded(self, rows: list[dict], label: str):
+        self._gh_label = label
+        self._gh_items = rows or []
+        self._gh_selected = None
+        self._gh_readme = ""
+        self.gh_store.clear()
+        for it in self._gh_items:
+            self.gh_store.append([it.get("title") or "(untitled)",
+                                  it.get("meta") or ""])
+        self.gh_open_btn.set_sensitive(False)
+        self.gh_ask_btn.set_sensitive(False)
+        self.gh_digest_btn.set_sensitive(bool(self._gh_items))
+        if not self._gh_items:
+            self._render_md(self.gh_detail,
+                            f"*{label} returned nothing — try again.*")
+            self._error(f"GitHub: no results for {label}")
+            return
+        self._render_md(
+            self.gh_detail,
+            f"**{label}** — {len(self._gh_items)} rows\n\n"
+            "*Select a row for detail, **Open on GitHub** in the browser, "
+            "**Ask AI** about it, or **AI digest** to summarize the list.*")
+        self.gh_table.get_selection().select_path(
+            Gtk.TreePath.new_from_string("0"))
+        self._busy(f"{len(self._gh_items)} results · GitHub (free)")
+
+    def _gh_repo_loaded(self, out: dict):
+        row = out.get("repo") or {}
+        self._gh_label = f"Repo: {row.get('full_name') or ''}"
+        self._gh_items = [row] if row else []
+        self._gh_selected = row or None
+        self._gh_readme = out.get("readme") or ""
+        self.gh_store.clear()
+        if row:
+            self.gh_store.append([row.get("title") or "",
+                                  row.get("meta") or ""])
+        self.gh_open_btn.set_sensitive(bool(row))
+        self.gh_ask_btn.set_sensitive(bool(row))
+        self.gh_digest_btn.set_sensitive(bool(row))
+        if not row:
+            self._error("GitHub: no repository found")
+            return
+        self._gh_render_detail()
+        self._busy(f"{row.get('full_name')} · GitHub (free)")
+
+    def _on_gh_selected(self):
+        model, treeiter = self.gh_table.get_selection().get_selected()
+        if treeiter is None:
+            return
+        idx = model.get_path(treeiter).get_indices()[0]
+        if idx >= len(self._gh_items):
+            return
+        self._gh_selected = self._gh_items[idx]
+        self._gh_render_detail()
+
+    def _gh_render_detail(self):
+        p = self._gh_selected
+        if not p:
+            return
+        lines = [f"**{p.get('title') or '(untitled)'}**", ""]
+        if p.get("subtitle"):
+            lines += [_esc(p["subtitle"]), ""]
+        if p.get("meta"):
+            lines += [f"*{_esc(p['meta'])}*", ""]
+        if p.get("body"):
+            lines += [_esc(p["body"]), ""]
+        if p.get("url"):
+            lines.append(f"[Open on GitHub]({p['url']})")
+        if self._gh_readme:
+            lines += ["", "---", "", self._gh_readme[:30000]]
+        url = p.get("url") or ""
+        self._render_md(self.gh_detail, "\n".join(lines),
+                        base_url=(url + "/") if url else None)
+        self.gh_open_btn.set_sensitive(bool(url))
+        self.gh_ask_btn.set_sensitive(True)
+
+    def _gh_open(self):
+        p = self._gh_selected
+        if p and p.get("url"):
+            try:
+                Gio.AppInfo.launch_default_for_uri(p["url"], None)
+            except GLib.Error as e:
+                self._error(f"could not open {p['url']}: {e.message}")
+
+    def _gh_digest(self):
+        rows = self._gh_items
+        if not rows:
+            self._error("load some repositories first, then press AI digest")
+            return
+        n = min(len(rows), 12)
+        self._ai_ask(
+            f"Write a digest of these GitHub {self._gh_label} results below. "
+            "You can call the github_* tools for anything more detailed.",
+            gh_digest_prompt(self._gh_label, rows),
+            display=f"Write a digest of the GitHub {self._gh_label} results.")
+        self._busy(f"AI is digesting {n} GitHub rows…")
+
+    def _gh_ask_ai(self):
+        p = self._gh_selected
+        if not p:
+            self._error("select a repository or issue first")
+            return
+        summary = p.get("body") or p.get("subtitle") or ""
+        context = (
+            f"GitHub tab — {self._gh_label}\n"
+            f"Item: {p.get('title') or ''}\n"
+            f"Meta: {p.get('meta') or ''}\n"
+            f"URL: {p.get('url') or ''}\n"
+            + (f"Summary: {summary}\n" if summary else "")
+            + "\nOn screen:\n" + self._text(self.gh_detail)[:8000]
+        )
+        self._ai_ask(
+            "Explain this GitHub item: what the project (or issue/release) "
+            "is, how active and notable it is, the key technical points, and "
+            "anything a developer should know. Use the github_* tools for "
+            "issues, releases or related projects if it helps.",
+            context,
+            display=f"Explain this GitHub item: {p.get('title', '')}")
+
+    # -- command palette (Ctrl+K) ---------------------------------------------
+
+    def _tab_index(self, label: str) -> int:
+        for i in range(self.tabs.get_n_pages()):
+            if self.tabs.get_tab_label_text(self.tabs.get_nth_page(i)) == label:
+                return i
+        return 0
+
+    def _palette_static(self) -> list[tuple[str, str, str, object]]:
+        labels = [self.tabs.get_tab_label_text(self.tabs.get_nth_page(i))
+                  for i in range(self.tabs.get_n_pages())]
+        rows = [(f"Go to {label}", f"switch to the {label} tab", "tab", i)
+                for i, label in enumerate(labels)]
+        rows += [
+            ("New AI chat", "clear the conversation", "ai_new", None),
+            ("Refresh team and balance",
+             "reload the team and prepaid balance", "refresh", None),
+        ]
+        return rows
+
+    def _build_palette(self):
+        dlg = Gtk.Dialog()
+        dlg.set_title("Command palette")
+        dlg.set_transient_for(self)
+        dlg.set_destroy_with_parent(True)
+        dlg.set_modal(True)
+        dlg.set_default_size(700, 460)
+        dlg.add_button("Close", Gtk.ResponseType.CLOSE)
+        dlg.connect("response", lambda d, r: d.hide())
+        box = dlg.get_content_area()
+        box.set_spacing(6)
+        box.set_border_width(8)
+        self.palette_entry = Gtk.Entry()
+        self.palette_entry.set_placeholder_text(
+            "Go to a tab, search a source, open a repo, or ask the AI…")
+        box.pack_start(self.palette_entry, False, False, 0)
+        self.palette_store = Gtk.ListStore(str, str)
+        self.palette_view = Gtk.TreeView(model=self.palette_store)
+        self.palette_view.set_can_focus(False)
+        for header, idx in (("Action", 0), ("Details", 1)):
+            col = Gtk.TreeViewColumn(header, Gtk.CellRendererText(), text=idx)
+            if idx == 0:
+                col.set_expand(True)
+            self.palette_view.append_column(col)
+        self.palette_view.connect(
+            "row-activated",
+            lambda v, p, c: self._palette_run(p.get_indices()[0]))
+        box.pack_start(self._scrolled(self.palette_view), True, True, 0)
+        self.palette_entry.connect("changed", lambda e: self._palette_filter())
+        self.palette_entry.connect(
+            "activate", lambda e: self._palette_run_selected())
+        self.palette_entry.connect("key-press-event", self._palette_key)
+        self._palette = dlg
+
+    def _open_palette(self):
+        if self._palette is None:
+            self._build_palette()
+        self.palette_entry.set_text("")
+        self._palette_filter()
+        self._palette.show_all()
+        self.palette_entry.grab_focus()
+
+    def _on_window_key(self, widget, event) -> bool:
+        if (event.state & Gdk.ModifierType.CONTROL_MASK
+                and event.keyval in (Gdk.KEY_k, Gdk.KEY_K)):
+            self._open_palette()
+            return True
+        return False
+
+    def _palette_key(self, entry, event) -> bool:
+        if event.keyval == Gdk.KEY_Escape:
+            self._palette.hide()
+            return True
+        if event.keyval in (Gdk.KEY_Down, Gdk.KEY_Up):
+            self._palette_move(1 if event.keyval == Gdk.KEY_Down else -1)
+            return True
+        return False
+
+    def _palette_move(self, delta: int):
+        n = len(self.palette_store)
+        if not n:
+            return
+        model, it = self.palette_view.get_selection().get_selected()
+        cur = model.get_path(it)[0] if it is not None else -1
+        path = 0 if cur < 0 else cur + delta
+        path = max(0, min(path, n - 1))
+        self.palette_view.get_selection().select_path(
+            Gtk.TreePath.new_from_string(str(path)))
+        self.palette_view.scroll_to_cell(path, None, False, 0.0, 0.0)
+
+    def _palette_filter(self):
+        q = self.palette_entry.get_text().strip()
+        rows: list[tuple[str, str, str, object]] = []
+        if q:
+            rows.append((f"Ask AI: {q}", "send this question to the AI tab",
+                         "ask", q))
+            slug = gh_repo_slug(q)
+            if slug:
+                rows.append((f"Open GitHub repo: {slug}",
+                             "README, stats and issues", "gh_repo", slug))
+            rows.append((f"Search GitHub for: {q}", "repositories",
+                         "gh_search", q))
+            rows.append((f"Search the catalog for: {q}", "treg endpoints",
+                         "catalog", q))
+            rows.append((f"Search the news for: {q}", "treg news search",
+                         "news", q))
+            rows.append((f"Search Hacker News for: {q}", "free Algolia index",
+                         "hn", q))
+            rows.append((f"Browse the web for: {q}", "treg web search",
+                         "browse", q))
+            if re.fullmatch(r"[A-Za-z][A-Za-z0-9.\-^=]{0,5}", q):
+                rows.append((f"Market quote: {q.upper()}",
+                             "stocks and ETFs", "markets", q))
+        rows += [r for r in self._palette_static()
+                 if not q or q.lower() in r[0].lower()]
+        self._palette_rows = rows
+        self.palette_store.clear()
+        for display, detail, _action, _payload in rows:
+            self.palette_store.append([display, detail])
+        if rows:
+            self.palette_view.get_selection().select_path(
+                Gtk.TreePath.new_from_string("0"))
+        else:
+            self.palette_view.get_selection().unselect_all()
+
+    def _palette_run_selected(self):
+        model, it = self.palette_view.get_selection().get_selected()
+        if it is None:
+            return
+        self._palette_run(model.get_path(it)[0])
+
+    def _palette_run(self, index: int):
+        if not (0 <= index < len(self._palette_rows)):
+            return
+        _display, _detail, action, payload = self._palette_rows[index]
+        self._palette.hide()
+        self._palette_do(action, payload)
+
+    def _palette_do(self, action: str, payload):
+        if action == "tab":
+            self.tabs.set_current_page(int(payload))
+        elif action == "ai_new":
+            self.tabs.set_current_page(self._tab_index("AI"))
+            self._ai_new_chat()
+        elif action == "refresh":
+            self._refresh_identity()
+        elif action == "ask":
+            self._ai_ask(str(payload))
+        elif action == "browse":
+            self.tabs.set_current_page(self._tab_index("Browse"))
+            self.browse_query.set_text(str(payload))
+            self._do_browse_search()
+        elif action == "catalog":
+            self.tabs.set_current_page(self._tab_index("Catalog"))
+            self.search_edit.set_text(str(payload))
+            self._do_search()
+        elif action == "news":
+            self.tabs.set_current_page(self._tab_index("News"))
+            self.news_mode.set_active(_NEWS_MODES.index("search"))
+            self.news_entry.set_text(str(payload))
+            self._news_go()
+        elif action == "hn":
+            self.tabs.set_current_page(self._tab_index("Hacker News"))
+            self.hn_mode.set_active(_HN_MODES.index("search"))
+            self.hn_entry.set_text(str(payload))
+            self._hn_go()
+        elif action == "gh_search":
+            self.tabs.set_current_page(self._tab_index("GitHub"))
+            self.gh_mode.set_active(_GH_MODES.index("search"))
+            self.gh_entry.set_text(str(payload))
+            self._gh_go()
+        elif action == "gh_repo":
+            self.tabs.set_current_page(self._tab_index("GitHub"))
+            self.gh_mode.set_active(_GH_MODES.index("repo"))
+            self.gh_entry.set_text(str(payload))
+            self._gh_go()
+        elif action == "markets":
+            self.tabs.set_current_page(self._tab_index("Markets"))
+            self.m_mode.set_active(0)
+            self.m_entry.set_text(str(payload))
+            self._m_go()
 
     # -- shutdown --------------------------------------------------------------------
 
