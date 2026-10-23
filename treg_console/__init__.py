@@ -1,3 +1,3 @@
 """treg console — a native Linux desktop app that uses treg (https://treg.to) as its backend."""
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"

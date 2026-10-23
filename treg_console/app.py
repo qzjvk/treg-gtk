@@ -10,8 +10,8 @@ Tabs:
   Browse   — search the web, click a result, read the page (the simple path)
   AI       — AI interaction: chat with the local model, which can call every
              data source in the app as a tool (treg catalog + any endpoint,
-             web, X, Reddit, News, Markets, Hacker News, GitHub, OLX.pt) and
-             answer in Markdown
+             web, X, Reddit, News, Markets, Hacker News, GitHub, OLX.pt,
+             eBay) and answer in Markdown
   Catalog  — search the 4,000+ endpoint catalog, inspect params/price/reliability
   Providers — browse the platform catalog by category, drill into a
              platform's capabilities and endpoints
@@ -37,6 +37,10 @@ Tabs:
   OLX      — an OLX.pt frontend: classifieds search with category, price and
              sort filters, or any listing by id or URL, via the free public
              JSON API, with Ask AI / AI digest
+  eBay     — an eBay frontend: listing search with category and price order,
+             or full listing detail by product id or URL, through treg's
+             paid SerpApi eBay endpoints ($0.015 per call), with Ask AI /
+             AI digest
   Ctrl+K   — a command palette that jumps to any tab, searches a source, or
              hands the query to the AI
   Alt+<n>  — switch tabs from anywhere: Alt+1…Alt+9, Alt+0 for the tenth,
@@ -70,6 +74,8 @@ import httpx
 from .ai import (AI_MODEL, AI_URL, run_agent, tool_summary)
 from .client import TregClient, TregError, load_credentials, poll_async_task
 from .desktop import install_desktop_entry, remove_desktop_entry
+from .ebay import (digest_prompt as ebay_digest_prompt,
+                   listing as ebay_listing, search as ebay_search)
 from .github import (digest_prompt as gh_digest_prompt,
                      issues as gh_issues, releases as gh_releases,
                      repo as gh_repo, repo_slug as gh_repo_slug,
@@ -569,11 +575,12 @@ class MainWindow(Gtk.ApplicationWindow):
     AI_HINT = ("**AI interaction** — ask anything. I can use every data source "
                "in the app as a tool: the treg catalog and any endpoint, web "
                "search and pages, X, Reddit, News, Markets, Hacker News, "
-               "GitHub and OLX.pt.\n\n"
+               "GitHub, OLX.pt and eBay.\n\n"
                "Try: *“what's moving in the market today and why?”*, "
                "*“summarize the top tech news”*, *“what's hot on Hacker News "
                "right now?”*, *“compare Rust web frameworks on GitHub”*, "
                "*“find an iPhone 13 under 300 € on OLX”*, "
+               "*“find a used iPhone 13 on eBay and compare it with OLX”*, "
                "*“find an endpoint for backlinks and call it for "
                "example.com”*.")
 
@@ -611,6 +618,10 @@ class MainWindow(Gtk.ApplicationWindow):
         self._olx_selected: dict | None = None
         self._olx_result: dict = {}
         self._olx_label = "OLX.pt"
+        self._ebay_items: list[dict] = []
+        self._ebay_selected: dict | None = None
+        self._ebay_result: dict = {}
+        self._ebay_label = "eBay"
         self._palette: Gtk.Dialog | None = None
         self._palette_rows: list[tuple[str, str, str, object]] = []
         self._md_links: dict[Gtk.TextView, list[tuple[int, int, str]]] = {}
@@ -680,6 +691,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self._add_tab(self._build_hn_tab(), "Hacker News")
         self._add_tab(self._build_gh_tab(), "GitHub")
         self._add_tab(self._build_olx_tab(), "OLX")
+        self._add_tab(self._build_ebay_tab(), "eBay")
         self.tabs.set_current_page(0)
         root.pack_start(self.tabs, True, True, 0)
 
@@ -1560,6 +1572,110 @@ class MainWindow(Gtk.ApplicationWindow):
             "*Search OLX.pt by keyword, or choose a category and leave the "
             "query empty to browse it. Filter by price, sort, then press "
             "**Go**. Free — OLX's public JSON API, no treg calls.*")
+        return w
+
+    def _build_ebay_tab(self) -> Gtk.Widget:
+        """An eBay frontend routed through treg's SerpApi endpoints: listing
+        search by keyword/category, or full listing detail by product id or
+        URL. Paid — search and detail are $0.015 per successful call. Ask AI
+        and AI digest hand the current view to the AI tab, which can also
+        search eBay with ebay_search."""
+        w = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.ebay_mode = Gtk.ComboBoxText()
+        self.ebay_mode.append("search", "Search")
+        self.ebay_mode.append("listing", "Listing detail")
+        self.ebay_mode.set_active_id("search")
+        self.ebay_mode.connect("changed", self._ebay_mode_changed)
+        self.ebay_entry = Gtk.Entry()
+        self.ebay_entry.set_placeholder_text(
+            "search eBay.com — e.g. “iphone 13”")
+        self.ebay_entry.connect("activate", lambda e: self._ebay_go())
+        self.ebay_limit = Gtk.SpinButton.new_with_range(5, 50, 5)
+        self.ebay_limit.set_value(25)
+        self.ebay_limit.set_size_request(64, -1)
+        self.ebay_limit.set_tooltip_text(
+            "listings to show (the search fetch is about 60 rows)")
+        go = Gtk.Button(label="Go")
+        go.set_tooltip_text("Search eBay (paid: $0.015 per successful call)")
+        go.connect("clicked", lambda b: self._ebay_go())
+        row.pack_start(self.ebay_mode, False, False, 0)
+        row.pack_start(self.ebay_entry, True, True, 0)
+        row.pack_start(self.ebay_limit, False, False, 0)
+        row.pack_start(go, False, False, 0)
+        w.pack_start(row, False, False, 0)
+
+        filters = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.ebay_category = Gtk.ComboBoxText()
+        self.ebay_category.append("", "All categories")
+        self.ebay_category.set_active(0)
+        self.ebay_category.set_tooltip_text(
+            "category filter — filled with the categories eBay offered for "
+            "the last search")
+        self.ebay_sort = Gtk.ComboBoxText()
+        self.ebay_sort.append("relevance", "Relevance")
+        self.ebay_sort.append("cheapest", "Cheapest")
+        self.ebay_sort.append("expensive", "Most expensive")
+        self.ebay_sort.set_active_id("relevance")
+        self.ebay_sort.set_tooltip_text(
+            "price order, applied to the fetched page")
+        filters.pack_start(self.ebay_category, True, True, 0)
+        filters.pack_start(self.ebay_sort, False, False, 0)
+        self.ebay_filters = filters
+        w.pack_start(filters, False, False, 0)
+
+        paned = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL)
+        self.ebay_store = Gtk.ListStore(str, str)
+        self.ebay_table = Gtk.TreeView(model=self.ebay_store)
+        for header, col_idx in (("Listing", 0), ("Price · condition", 1)):
+            col = Gtk.TreeViewColumn(header, Gtk.CellRendererText(),
+                                     text=col_idx)
+            if col_idx == 0:
+                col.set_expand(True)
+            self.ebay_table.append_column(col)
+        self.ebay_table.get_selection().connect(
+            "changed", lambda s: self._on_ebay_selected())
+        paned.pack1(self._scrolled(self.ebay_table), True, True)
+        self.ebay_detail = self._textview()
+        self.ebay_detail.connect("button-press-event", self._md_link_click)
+        paned.pack2(self._scrolled(self.ebay_detail), True, True)
+        paned.set_position(620)
+        w.pack_start(paned, True, True, 0)
+
+        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.ebay_open_btn = Gtk.Button(label="Open on eBay")
+        self.ebay_open_btn.set_sensitive(False)
+        self.ebay_open_btn.connect("clicked", lambda b: self._ebay_open())
+        self.ebay_full_btn = Gtk.Button(label="Full listing ($0.015)")
+        self.ebay_full_btn.set_tooltip_text(
+            "Fetch the full listing detail through treg — paid $0.015 per "
+            "successful call")
+        self.ebay_full_btn.set_sensitive(False)
+        self.ebay_full_btn.connect("clicked", lambda b: self._ebay_full())
+        self.ebay_digest_btn = Gtk.Button(label="AI digest")
+        self.ebay_digest_btn.set_tooltip_text(
+            f"Summarize the current eBay listings in the AI tab ({AI_MODEL})")
+        self.ebay_digest_btn.set_sensitive(False)
+        self.ebay_digest_btn.connect("clicked", lambda b: self._ebay_digest())
+        self.ebay_ask_btn = Gtk.Button(label="Ask AI")
+        self.ebay_ask_btn.set_tooltip_text(
+            "Ask the AI about the selected listing — it can compare similar "
+            "listings with ebay_search (paid)")
+        self.ebay_ask_btn.set_sensitive(False)
+        self.ebay_ask_btn.connect("clicked", lambda b: self._ebay_ask_ai())
+        btn_row.pack_start(self.ebay_open_btn, False, False, 0)
+        btn_row.pack_start(self.ebay_full_btn, False, False, 0)
+        btn_row.pack_start(self.ebay_digest_btn, False, False, 0)
+        btn_row.pack_start(self.ebay_ask_btn, False, False, 0)
+        w.pack_start(btn_row, False, False, 0)
+
+        self._render_md(
+            self.ebay_detail,
+            "*Search eBay.com by keyword or browse a category, then press "
+            "**Go**. Search is paid through treg — $0.015 per successful "
+            "call; **Full listing** is a second $0.015 call. Select a row for "
+            "its price, condition, shipping, seller and returns.*")
         return w
 
     # -- plumbing -------------------------------------------------------------
@@ -4003,6 +4119,389 @@ class MainWindow(Gtk.ApplicationWindow):
             context,
             display=f"Explain this OLX.pt listing: {p.get('title', '')}")
 
+    # -- eBay tab --------------------------------------------------------------
+
+    def _ebay_mode_changed(self, *args):
+        listing = (self.ebay_mode.get_active_id() or "search") == "listing"
+        self.ebay_entry.set_placeholder_text(
+            "eBay product id or URL — e.g. 336847604413" if listing else
+            "search eBay.com — e.g. “iphone 13”")
+        self.ebay_filters.set_sensitive(not listing)
+        self.ebay_limit.set_sensitive(not listing)
+        self._ebay_items = []
+        self._ebay_selected = None
+        self._ebay_result = {}
+        self._ebay_label = "eBay"
+        self._ebay_fill_categories([])
+        self.ebay_store.clear()
+        self.ebay_open_btn.set_sensitive(False)
+        self.ebay_full_btn.set_sensitive(False)
+        self.ebay_digest_btn.set_sensitive(False)
+        self.ebay_ask_btn.set_sensitive(False)
+        self._render_md(
+            self.ebay_detail,
+            "*Paste an eBay product id or listing URL and press **Go** for "
+            "the full listing. Paid through treg — $0.015 per successful "
+            "call.*" if listing else
+            "*Search eBay.com by keyword or browse a category, then press "
+            "**Go**. Search is paid through treg — $0.015 per successful "
+            "call; **Full listing** is a second $0.015 call. Select a row for "
+            "its price, condition, shipping, seller and returns.*")
+
+    def _ebay_fill_categories(self, categories: list[dict],
+                              selected: str | None = None):
+        selected = str(selected or "")
+        self.ebay_category.remove_all()
+        self.ebay_category.append("", "All categories")
+        ids = {""}
+        for cat in categories or []:
+            cid = str(cat.get("id") or "")
+            name = cat.get("name") or f"Category {cid}"
+            if not cid or cid in ids:
+                continue
+            ids.add(cid)
+            self.ebay_category.append(cid, name)
+        if selected and selected not in ids:
+            self.ebay_category.append(selected, f"Category {selected}")
+            ids.add(selected)
+        if not self.ebay_category.set_active_id(selected):
+            self.ebay_category.set_active(0)
+
+    def _ebay_go(self):
+        if self.client is None:
+            self._error("eBay: no treg token — run `treg login` or set "
+                        "TREG_TOKEN")
+            return
+        mode = self.ebay_mode.get_active_id() or "search"
+        value = self.ebay_entry.get_text().strip()
+        if mode == "listing":
+            if not value:
+                self._error("enter an eBay product id or listing URL")
+                return
+            self._busy(f"Loading eBay listing {value[:60]}… "
+                       "(paid $0.015 via treg)")
+            self._spawn(
+                lambda: ebay_listing(self.client, value),
+                on_ok=self._ebay_listing_loaded,
+                on_fail=lambda m: self._error(f"eBay: {m}"))
+            return
+        cat_id = self.ebay_category.get_active_id() or None
+        if not value and not cat_id:
+            self._error("enter a search or choose a category")
+            return
+        sort = self.ebay_sort.get_active_id() or "relevance"
+        limit = int(self.ebay_limit.get_value())
+        self._busy(f"Searching eBay for “{value}”… (paid $0.015 via treg)"
+                   if value else "Loading eBay category… (paid $0.015 via treg)")
+        self._spawn(
+            lambda: ebay_search(self.client, value, category_id=cat_id,
+                                sort=sort, limit=limit),
+            on_ok=self._ebay_loaded,
+            on_fail=lambda m: self._error(f"eBay: {m}"))
+
+    def _ebay_loaded(self, out: dict):
+        self._ebay_result = out or {}
+        self._ebay_items = (out or {}).get("rows") or []
+        self._ebay_selected = None
+        self._ebay_label = self._ebay_result_label(out or {})
+        self._ebay_fill_categories(
+            (out or {}).get("categories") or [],
+            (out or {}).get("category_id"))
+        self.ebay_store.clear()
+        for it in self._ebay_items:
+            self.ebay_store.append([it.get("title") or "(untitled)",
+                                    it.get("meta") or ""])
+        self.ebay_open_btn.set_sensitive(False)
+        self.ebay_ask_btn.set_sensitive(False)
+        self.ebay_full_btn.set_sensitive(False)
+        self.ebay_digest_btn.set_sensitive(bool(self._ebay_items))
+        if not self._ebay_items:
+            self._render_md(
+                self.ebay_detail,
+                f"*No eBay listings for {_esc(self._ebay_label)} — try a "
+                "broader query or another category.*")
+            self._error(f"eBay: no listings for {self._ebay_label}")
+            return
+        total = int((out or {}).get("total") or len(self._ebay_items))
+        available = int((out or {}).get("available")
+                        or len(self._ebay_items))
+        cost = usd_amount((out or {}).get("cost_usd"))
+        self._render_md(
+            self.ebay_detail,
+            f"**{_esc(self._ebay_label)}** — {len(self._ebay_items)} of "
+            f"{total:,} listings\n\n"
+            f"*Fetched {available} rows; charged {cost} through treg. Select "
+            "a row for its price, condition, shipping and seller, **Full "
+            "listing** for the item specifics and description ($0.015), "
+            "**Open on eBay** in the browser, **Ask AI** to judge it, or "
+            "**AI digest** to summarize the list.*")
+        self.ebay_table.get_selection().select_path(
+            Gtk.TreePath.new_from_string("0"))
+        self._busy(f"{len(self._ebay_items)} of {total:,} listings · eBay "
+                   f"(treg) · charged {cost}")
+
+    def _ebay_result_label(self, out: dict) -> str:
+        q = out.get("query") or ""
+        cat = out.get("category") or ""
+        sort = out.get("sort") or "relevance"
+        if q:
+            label = f"Search: {q}"
+        elif cat and cat != "All categories":
+            label = f"Category: {cat}"
+        else:
+            label = "eBay listings"
+        if sort == "cheapest":
+            label += " · cheapest"
+        elif sort == "expensive":
+            label += " · most expensive"
+        return label
+
+    def _ebay_listing_loaded(self, row: dict):
+        self._ebay_items = [row] if row else []
+        self._ebay_selected = row or None
+        self._ebay_result = {"rows": self._ebay_items, "total": 1,
+                             "query": "", "category": ""}
+        self._ebay_label = f"Listing {row.get('id')}" if row else "Listing"
+        self.ebay_store.clear()
+        if row:
+            self.ebay_store.append([row.get("title") or "",
+                                    row.get("meta") or ""])
+        self.ebay_open_btn.set_sensitive(bool(row and row.get("url")))
+        self.ebay_ask_btn.set_sensitive(bool(row))
+        self.ebay_digest_btn.set_sensitive(bool(row))
+        self.ebay_full_btn.set_sensitive(False)
+        if not row:
+            self._error("eBay: no listing found")
+            return
+        self._ebay_render_detail()
+        cost = usd_amount(row.get("cost_usd"))
+        self._busy(f"{row.get('title', '')[:60]} · eBay (treg) · "
+                   f"charged {cost}")
+
+    def _on_ebay_selected(self):
+        model, it = self.ebay_table.get_selection().get_selected()
+        if it is None:
+            return
+        idx = model.get_path(it).get_indices()[0]
+        if idx >= len(self._ebay_items):
+            return
+        self._ebay_selected = self._ebay_items[idx]
+        self._ebay_render_detail()
+
+    def _ebay_render_detail(self):
+        p = self._ebay_selected
+        if not p:
+            return
+        price = p.get("price") or {}
+        price_label = price.get("label") or p.get("price_label") \
+            or "Price not stated"
+        lines = [f"**{_esc(p.get('title') or '(untitled)')}**", ""]
+        head = f"**{_esc(price_label)}**"
+        if p.get("old_price_label"):
+            head += f" · was {_esc(p['old_price_label'])}"
+        if p.get("sponsored"):
+            head += " · sponsored"
+        lines += [head, ""]
+        bits = []
+        if p.get("condition"):
+            bits.append(_esc(p["condition"]))
+        if p.get("buying_format_text"):
+            bits.append(_esc(p["buying_format_text"]))
+        if p.get("location"):
+            bits.append(_esc(p["location"]))
+        if bits:
+            lines += [" · ".join(bits), ""]
+        extra = []
+        if p.get("shipping_label"):
+            extra.append(f"Shipping: **{_esc(p['shipping_label'])}**")
+        if p.get("returns"):
+            extra.append(f"Returns: **{_esc(p['returns'])}**")
+        if p.get("watchers"):
+            extra.append(f"Watchers: {_esc(p['watchers'])}")
+        if p.get("sold"):
+            extra.append(f"Sold: {_esc(p['sold'])}")
+        if p.get("rating") not in (None, ""):
+            r = f"Rating: {p.get('rating')}"
+            if p.get("reviews") not in (None, ""):
+                r += f" ({p['reviews']} reviews)"
+            extra.append(r)
+        if p.get("banner_status"):
+            extra.append(_esc(p["banner_status"]))
+        if p.get("extensions"):
+            extra.append(" · ".join(_esc(x) for x in p["extensions"]))
+        for line in extra:
+            lines.append(f"- {line}")
+        if extra:
+            lines.append("")
+        seller = p.get("seller") or {}
+        if seller.get("name") or seller.get("username"):
+            name = seller.get("name") or seller.get("username")
+            head = f"Seller: **{_esc(name)}**"
+            if seller.get("username") and seller["username"] != name:
+                head += f" ({_esc(seller['username'])})"
+            lines.append(head)
+            fb = []
+            if seller.get("positive_percent") not in (None, ""):
+                fb.append(f"{seller['positive_percent']}% positive")
+            if seller.get("feedback_count") not in (None, ""):
+                fb.append(f"{seller['feedback_count']} feedback")
+            if seller.get("sold_count") not in (None, ""):
+                fb.append(f"{seller['sold_count']} sold")
+            if seller.get("joined_at"):
+                fb.append(_esc(seller["joined_at"]))
+            if fb:
+                lines.append(" · ".join(fb))
+            if seller.get("bio"):
+                lines.append("")
+                lines.append(_esc(seller["bio"][:800]))
+            lines.append("")
+        options = p.get("shipping_options") or []
+        if len(options) > 1:
+            lines.append("**Shipping options**")
+            for opt in options[:6]:
+                label = opt.get("label") or ""
+                via = opt.get("via") or ""
+                lines.append("- " + " · ".join(x for x in (label, via) if x))
+            lines.append("")
+        specs = p.get("specs") or []
+        if specs:
+            lines.append("**Item specifics**")
+            for spec in specs[:40]:
+                lines.append(f"- **{_esc(spec.get('name', ''))}:** "
+                             f"{_esc(spec.get('value', ''))}")
+            lines.append("")
+        desc = p.get("description") or ""
+        if desc:
+            lines += ["**Description**", "", _esc(desc), ""]
+        photos = p.get("photos") or []
+        if photos:
+            links = " · ".join(f"[{i}]({u})"
+                               for i, u in enumerate(photos[:6], 1))
+            lines += [f"**Photos ({len(photos)}):** {links}", ""]
+        source = p.get("source") or "SerpApi eBay"
+        if p.get("full"):
+            cost = usd_amount(p.get("cost_usd"))
+            lines += [f"*{_esc(source)} via treg — charged {cost}.*", ""]
+        else:
+            cost = usd_amount((self._ebay_result or {}).get("cost_usd"))
+            lines += ["*From the eBay search results via treg — the search "
+                      f"was charged {cost}.*", ""]
+        if p.get("url"):
+            lines.append(f"[Open on eBay]({p['url']})")
+        self._render_md(self.ebay_detail, "\n".join(lines))
+        self.ebay_open_btn.set_sensitive(bool(p.get("url")))
+        self.ebay_ask_btn.set_sensitive(True)
+        self.ebay_full_btn.set_sensitive(
+            bool(p.get("id")) and not p.get("full"))
+
+    def _ebay_full(self):
+        p = self._ebay_selected
+        if not p or not p.get("id"):
+            self._error("select an eBay listing first")
+            return
+        if p.get("full"):
+            self._error("this listing is already fully loaded")
+            return
+        if self.client is None:
+            self._error("eBay: no treg token — run `treg login` or set "
+                        "TREG_TOKEN")
+            return
+        self._busy(f"Loading full eBay listing {p['id']}… "
+                   "(paid $0.015 via treg)")
+        self._spawn(
+            lambda: ebay_listing(self.client, p["id"], base=p),
+            on_ok=self._ebay_full_loaded,
+            on_fail=lambda m: self._error(f"eBay: {m}"))
+
+    def _ebay_full_loaded(self, row: dict):
+        if not row:
+            self._error("eBay: no full listing returned")
+            return
+        idx = None
+        for i, it in enumerate(self._ebay_items):
+            if str(it.get("id")) == str(row.get("id")):
+                idx = i
+                break
+        if idx is None:
+            self._ebay_items = [row]
+            idx = 0
+        else:
+            self._ebay_items[idx] = row
+        self._ebay_selected = row
+        model_it = self.ebay_store.get_iter(
+            Gtk.TreePath.new_from_string(str(idx)))
+        self.ebay_store.set(model_it, 0, row.get("title") or "",
+                            1, row.get("meta") or "")
+        self.ebay_table.get_selection().select_path(
+            Gtk.TreePath.new_from_string(str(idx)))
+        self._ebay_render_detail()
+        cost = usd_amount(row.get("cost_usd"))
+        self._busy(f"{row.get('title', '')[:60]} · eBay (treg) · "
+                   f"charged {cost}")
+
+    def _ebay_open(self):
+        p = self._ebay_selected
+        if p and p.get("url"):
+            try:
+                Gio.AppInfo.launch_default_for_uri(p["url"], None)
+            except GLib.Error as e:
+                self._error(f"could not open {p['url']}: {e.message}")
+
+    def _ebay_digest(self):
+        rows = self._ebay_items
+        if not rows:
+            self._error("search for some eBay listings first, then press AI "
+                        "digest")
+            return
+        out = self._ebay_result or {}
+        total = out.get("total")
+        self._ai_ask(
+            "Write a digest of these eBay listings below. You can call "
+            "ebay_search to compare prices or find more options; it is paid "
+            "($0.015 per search), so use it only if needed.",
+            ebay_digest_prompt(self._ebay_label, rows, total),
+            display=f"Write a digest of the eBay {self._ebay_label} listings.")
+        self._busy(f"AI is digesting {min(len(rows), 15)} eBay listings…")
+
+    def _ebay_ask_ai(self):
+        p = self._ebay_selected
+        if not p:
+            self._error("select an eBay listing first")
+            return
+        seller = p.get("seller") or {}
+        specs = "; ".join(f"{s.get('name')}: {s.get('value')}"
+                          for s in (p.get("specs") or [])[:30])
+        shipping = p.get("shipping_label") or ""
+        if p.get("shipping_options"):
+            shipping = "; ".join(
+                " · ".join(x for x in (o.get("label"), o.get("via")) if x)
+                for o in p["shipping_options"][:4])
+        context = (
+            f"eBay tab — {self._ebay_label}\n"
+            f"Listing: {p.get('title') or ''}\n"
+            f"Price: {p.get('price_label') or 'not stated'}\n"
+            f"Condition: {p.get('condition') or ''}\n"
+            f"Buying format: {p.get('buying_format_text') or ''}\n"
+            f"Shipping: {shipping}\n"
+            f"Location: {p.get('location') or ''}\n"
+            f"Returns: {p.get('returns') or ''}\n"
+            f"Seller: {seller.get('name') or seller.get('username') or ''}"
+            f" ({seller.get('positive_percent') or '?'}% positive, "
+            f"{seller.get('feedback_count') or '?'} feedback)\n"
+            f"Details: {specs}\n"
+            f"URL: {p.get('url') or ''}\n"
+            f"\nDescription:\n{(p.get('description') or '')[:4000]}\n"
+            f"\nOn screen:\n{self._text(self.ebay_detail)[:8000]}"
+        )
+        self._ai_ask(
+            "Explain this eBay listing: what is being sold, whether the "
+            "asking price and shipping look fair for the item's condition, "
+            "how trustworthy the seller looks, what to check before buying, "
+            "and what to ask the seller. Use ebay_search to compare similar "
+            "listings if that helps; it is paid ($0.015 per search).",
+            context,
+            display=f"Explain this eBay listing: {p.get('title', '')}")
+
     # -- command palette (Ctrl+K) ---------------------------------------------
 
     def _tab_index(self, label: str) -> int:
@@ -4161,6 +4660,11 @@ class MainWindow(Gtk.ApplicationWindow):
             if q.isdigit() or "olx.pt" in q:
                 rows.append((f"Open OLX listing: {q}",
                              "price, place and details", "olx_listing", q))
+            rows.append((f"Search eBay for: {q}", "listings (paid, $0.015)",
+                         "ebay_search", q))
+            if q.isdigit() or "ebay." in q:
+                rows.append((f"Open eBay listing: {q}",
+                             "full detail (paid, $0.015)", "ebay_listing", q))
             rows.append((f"Browse the web for: {q}", "treg web search",
                          "browse", q))
             if re.fullmatch(r"[A-Za-z][A-Za-z0-9.\-^=]{0,5}", q):
@@ -4239,6 +4743,16 @@ class MainWindow(Gtk.ApplicationWindow):
             self.olx_mode.set_active_id("listing")
             self.olx_entry.set_text(str(payload))
             self._olx_go()
+        elif action == "ebay_search":
+            self.tabs.set_current_page(self._tab_index("eBay"))
+            self.ebay_mode.set_active_id("search")
+            self.ebay_entry.set_text(str(payload))
+            self._ebay_go()
+        elif action == "ebay_listing":
+            self.tabs.set_current_page(self._tab_index("eBay"))
+            self.ebay_mode.set_active_id("listing")
+            self.ebay_entry.set_text(str(payload))
+            self._ebay_go()
         elif action == "markets":
             self.tabs.set_current_page(self._tab_index("Markets"))
             self.m_mode.set_active(0)

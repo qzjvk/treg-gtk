@@ -71,6 +71,17 @@ class RegistryTest(unittest.TestCase):
     def test_tool_summary_lists_olx(self):
         self.assertIn("OLX.pt", ai.tool_summary())
 
+    def test_built_registry_covers_ebay(self):
+        reg = ai.build_registry(None)
+        names = set(reg.names())
+        for expected in ("ebay_search", "ebay_listing"):
+            self.assertIn(expected, names)
+
+    def test_tool_summary_lists_ebay_as_paid(self):
+        summary = ai.tool_summary()
+        self.assertIn("eBay", summary)
+        self.assertIn("paid", summary)
+
 
 class ParseActionTest(unittest.TestCase):
     def test_fenced_json_action(self):

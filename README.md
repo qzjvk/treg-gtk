@@ -3,22 +3,23 @@
 A native Linux desktop app (GTK3) that uses [treg](https://treg.to) as its
 backend. The simple path is the **Browse** tab: search the web, click a
 result, and read the page. Under the hood it's a full console — X (Twitter),
-Reddit, Hacker News, GitHub and OLX.pt frontends, a news front page, market
-data, a 4,000+ endpoint catalog, live calls with cost, and an **AI** tab whose
-model can call all of it as tools. **Ctrl+K** opens a command palette that
+Reddit, Hacker News, GitHub, OLX.pt and eBay frontends, a news front page,
+market data, a 4,000+ endpoint catalog, live calls with cost, and an **AI**
+tab whose model can call all of it as tools. **Ctrl+K** opens a command palette that
 jumps to any tab, searches a source, or hands the query straight to the AI.
 
 ## The goal
 
 The treg console is meant to become the **everything app** — one native
 window that is your gateway to the internet: search the web and read pages,
-browse social platforms, code and classifieds (X, Reddit, Hacker News, GitHub
-and OLX.pt today, more as treg's catalog grows), read the news, watch markets,
-and call any of treg's 4,000+ endpoints — all with live cost, without leaving
-the desktop. An **AI interaction** tab ties it together: the local model can
-use every one of those data sources as a tool, so one question can search the
-catalog, read a page, scan news, check markets, skim Hacker News, compare
-GitHub repos and price a used phone on OLX in a single turn. A **Ctrl+K**
+browse social platforms, code and marketplaces (X, Reddit, Hacker News, GitHub,
+OLX.pt and eBay today, more as treg's catalog grows), read the news, watch
+markets, and call any of treg's 4,000+ endpoints — all with live cost, without
+leaving the desktop. An **AI interaction** tab ties it together: the local
+model can use every one of those data sources as a tool, so one question can
+search the catalog, read a page, scan news, check markets, skim Hacker News,
+compare GitHub repos and price a used phone on OLX and eBay in a single turn.
+A **Ctrl+K**
 palette makes that the front door: type a question, a search or a repo name
 and it routes to the right tab or to the AI. treg's catalog (113 platforms,
 new providers all the time) is the backend that makes this possible: every
@@ -50,9 +51,11 @@ you add.
    incomplete feature.
 4. **Prefer free tools; be honest about cost.** Free, direct sources (RSS,
    the official Hacker News API, GitHub, OLX.pt's public JSON API, yfinance)
-   come first; treg-routed calls are
-   paid. Descriptions and the system prompt must say which is which, and the
-   UI must show charges in the status bar. Never hide a cost.
+   come first; treg-routed calls are paid. eBay is deliberately treg-routed:
+   eBay has no keyless official API and blocks non-browser clients, so its
+   search and listing detail are paid SerpApi calls ($0.015 each).
+   Descriptions and the system prompt must say which is which, and the UI
+   must show charges in the status bar. Never hide a cost.
 5. **Pass context, don't re-fetch.** When a tab hands off to the AI it should
    include the rows and detail that are already on screen (as hidden context),
    so the model reasons about the current view. It may then call tools for
@@ -87,6 +90,8 @@ desktop environment shows the right icon and groups the window with the app.
   one (60 requests/hour); a token raises that to 5,000/hour
 - no key for the OLX tab — OLX.pt's public listings JSON API is free and
   needs no token
+- the eBay tab needs the same treg token and is **paid**: search and full
+  listing detail are $0.015 per successful call, charged to the team
 
 ## Run from a checkout
 
@@ -153,8 +158,9 @@ treg-console --no-desktop           # start without touching it
   treg, read Hacker News from its free official API (`hn_stories`,
   `hn_search`, `hn_item`, `hn_comments`), search GitHub and read repos,
   READMEs, issues and releases (`github_*`), search OLX.pt classifieds and
-  open any listing (`olx_*`), and pull stock quotes, history,
-  fundamentals and crypto from yfinance. Tool calls appear inline
+  open any listing (`olx_*`), search eBay and open any listing (`ebay_*`,
+  paid through treg), and pull stock quotes, history, fundamentals and crypto
+  from yfinance. Tool calls appear inline
   (`→ tool_name(...)` / `← result`) and
   answers render as Markdown with clickable links; the conversation is kept
   for follow-ups until **New chat**. Native OpenAI tool calling is used when
@@ -242,15 +248,26 @@ treg-console --no-desktop           # start without touching it
   OLX** in the browser, **AI digest** summarizes the current list, and **Ask
   AI** judges the selected listing and can compare similar ones with
   `olx_search`.
+- **eBay** — an eBay.com frontend routed through treg's paid SerpApi eBay
+  endpoints — **$0.015 per successful search and $0.015 per full listing
+  detail**, charged to the team and shown in the status bar. Two modes:
+  **Search** (keyword, category filters eBay offered for that query, and
+  relevance/cheapest/most-expensive order applied to the fetched page) and
+  **Listing detail** (a product id or eBay URL). Select a row for its price,
+  condition, shipping, location, seller feedback and returns; **Full
+  listing** fetches the item specifics, short description and photo links
+  (the second paid call), **Open on eBay** hands it to the browser, **AI
+  digest** summarizes the current list, and **Ask AI** judges the selected
+  listing and can compare similar ones with `ebay_search` (paid).
 - **Ctrl+K** — the command palette. One box to jump to any tab, search the
-  web/catalog/news/Hacker News/GitHub/OLX, open a repo by `owner/name` or an
-  OLX listing by id/URL, look up a ticker, or **Ask AI** the query. Arrow
-  keys move, Enter runs, Escape closes.
-  It is also a **Search / ask** button in the top bar.
+  web/catalog/news/Hacker News/GitHub/OLX/eBay, open a repo by `owner/name`
+  or an OLX/eBay listing by id/URL, look up a ticker, or **Ask AI** the query.
+  Arrow keys move, Enter runs, Escape closes. It is also a **Search / ask**
+  button in the top bar.
 - **Alt+1 … Alt+0** — switch tabs from anywhere, including while typing in a
   search field: Alt+1–9 for the first nine tabs, Alt+0 for the tenth (News),
-  and Alt+Shift+1/2/3 for Hacker News, GitHub and OLX. Each tab's tooltip
-  shows its shortcut, and the palette lists it too.
+  and Alt+Shift+1/2/3/4 for Hacker News, GitHub, OLX and eBay. Each tab's
+  tooltip shows its shortcut, and the palette lists it too.
 
 Every tab carries at least one AI action — that is the app's doctrine; see
 **Doctrine — how features are added**.
@@ -284,12 +301,14 @@ treg_console/
                        releases) for the GitHub tab and the AI tools
   olx.py               OLX.pt public JSON API source (search, categories,
                        listings) for the OLX tab and the AI tools
+  ebay.py              eBay source through treg's paid SerpApi endpoints
+                       (search, listing detail) for the eBay tab and tools
   desktop.py           .desktop + icon installation (user XDG dirs)
   icon.png             app icon
 ```
 
-Tests for the feed/API normalization (News, Hacker News, GitHub, OLX) and the
-AI agent live in `tests/`:
+Tests for the feed/API normalization (News, Hacker News, GitHub, OLX, eBay)
+and the AI agent live in `tests/`:
 
 ```sh
 python3 -m unittest discover -s tests -v

@@ -1,6 +1,6 @@
 project(
   'treg-console',
-  version: '1.5.0',
+  version: '1.6.0',
   license: 'MIT',
   meson_version: '>=1.8.0',
 )
@@ -18,6 +18,7 @@ install_data(
   'treg_console/ai.py',
   'treg_console/app.py',
   'treg_console/client.py',
+  'treg_console/ebay.py',
   'treg_console/github.py',
   'treg_console/hackernews.py',
   'treg_console/markets.py',

@@ -4,9 +4,9 @@ One OpenAI-compatible chat endpoint (the same local server the old Summarize
 tab used) becomes an agent with tools: the treg catalog (every endpoint,
 `treg_call` for anything), web search/extract, X, Reddit, News (RSS + treg
 search), Hacker News (free official API), GitHub (free public API), OLX.pt
-classifieds (free public JSON API) and Markets (yfinance). Native OpenAI tool
-calling is used when the server supports it; otherwise the agent falls back
-to a fenced-JSON tool protocol in plain chat.
+classifieds (free public JSON API), eBay (paid through treg) and Markets
+(yfinance). Native OpenAI tool calling is used when the server supports it;
+otherwise the agent falls back to a fenced-JSON tool protocol in plain chat.
 
 All functions here are synchronous and blocking — call them from a worker
 thread, never from the GUI thread.
@@ -34,6 +34,7 @@ from typing import Any, Callable
 import httpx
 
 from .client import TregClient, TregError, poll_async_task
+from .ebay import (listing as ebay_listing, search as ebay_search)
 from .github import (issues as gh_issues, releases as gh_releases,
                      repo as gh_repo, search_repos as gh_search,
                      trending as gh_trending)
@@ -637,6 +638,43 @@ def build_registry(client: TregClient | None,
         "`category` argument of olx_search (a name or slug works too). Free.",
         {}, [], lambda a: olx_categories())
 
+    # -- eBay (paid through treg) ------------------------------------------
+
+    def ebay_search_tool(a: dict) -> object:
+        return ebay_search(
+            _need(client),
+            str(a.get("query") or ""),
+            category_id=a.get("category_id"),
+            sort=str(a.get("sort") or "relevance"),
+            limit=int(a.get("limit") or 20),
+        )
+
+    def ebay_listing_tool(a: dict) -> object:
+        return ebay_listing(_need(client), str(a["listing"]))
+
+    reg.add(
+        "ebay_search",
+        "Search eBay.com listings by keyword or category through treg. Paid: "
+        "$0.015 per successful search, charged to the team. Rows carry title, "
+        "price and currency, condition, shipping, location, seller feedback, "
+        "returns, buying format, watchers/sold counts, product id and URL; "
+        "the result also has the total match count and the category filters "
+        "eBay offered for that query. Prices can be sorted client-side; the "
+        "limit trims the fetched page (about 60 rows). An empty query with a "
+        "category_id browses that category.",
+        {"query": _STR, "category_id": _INT,
+         "sort": {"type": "string",
+                  "enum": ["relevance", "cheapest", "expensive"]},
+         "limit": _INT},
+        [], ebay_search_tool)
+    reg.add(
+        "ebay_listing",
+        "One eBay.com listing in full by product id or eBay URL, through "
+        "treg. Paid: $0.015 per successful call. Returns title, price, "
+        "condition, shipping options, returns, seller and feedback, item "
+        "specifics, the short description, images, buying format and URL.",
+        {"listing": _STR}, ["listing"], ebay_listing_tool)
+
     # -- Markets (yfinance, free) ------------------------------------------
 
     def market_quote(a: dict) -> object:
@@ -718,16 +756,17 @@ def system_prompt() -> str:
         "You have tools for the treg catalog (thousands of API endpoints), "
         "web search and page reading, X/Twitter, Reddit, news (free RSS and "
         "treg news search), Hacker News (free), GitHub (free), OLX.pt "
-        "classifieds (free) and markets (stocks, fundamentals, crypto). Use "
-        "them instead of guessing whenever the question involves current "
-        "facts, prices, code, classifieds, posts or news. "
-        "Chain tools when needed: e.g. search the catalog, inspect an "
+        "classifieds (free), eBay (paid through treg) and markets (stocks, "
+        "fundamentals, crypto). Use them instead of guessing whenever the "
+        "question involves current facts, prices, code, classifieds, posts or "
+        "news. Chain tools when needed: e.g. search the catalog, inspect an "
         "endpoint, then call it.\n\n"
-        "Costs: treg_*, web_*, x_* and reddit_* calls are paid (usually "
-        "fractions of a cent) and charged to the team; news_top/news_tech/"
-        "news_business, the hn_*, github_* and olx_* tools and market_*/"
-        "crypto_* are free. Prefer free tools when they answer the question, "
-        "and do not repeat an expensive call.\n\n"
+        "Costs: treg_*, web_*, x_*, reddit_* and ebay_* calls are paid "
+        "(usually fractions of a cent) and charged to the team; eBay search "
+        "and listing detail are $0.015 each. news_top/news_tech/news_business, "
+        "the hn_*, github_* and olx_* tools and market_*/crypto_* are free. "
+        "Prefer free tools when they answer the question, and do not repeat "
+        "an expensive call.\n\n"
         "Style: answer in Markdown, concisely. Give numbers with units and "
         "cite the URLs you relied on. If a tool fails, say what failed and "
         "try a reasonable alternative; never invent data. If the question is "
@@ -946,6 +985,7 @@ def tool_summary() -> str:
         "hn": "Hacker News (free)",
         "github": "GitHub (free)",
         "olx": "OLX.pt (free)",
+        "ebay": "eBay (treg, paid)",
         "market": "Markets (stocks)",
         "crypto": "Crypto",
     }

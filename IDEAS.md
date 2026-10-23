@@ -37,13 +37,13 @@ arrives as a tab plus its AI tools.
   issue, **AI digest** summarizes the list, and the `github_*` tools are in the
   AI registry (see README).*
 - **AI over all of it** — an AI that can look at all of the above: reddit,
-  markets, news, Hacker News, GitHub, OLX, financial data. *Done — the **AI**
-  tab's model gets every data source in the app as a tool: the treg catalog
-  and any endpoint (async included), web search/extract, X, Reddit, News
-  (free RSS + treg search), Hacker News (free), GitHub (free), OLX.pt (free)
-  and Markets/crypto (yfinance), with native OpenAI tool calling and a JSON
-  fallback. See README.* The MCP-server idea below is still open, to expose
-  the same tools to any external MCP client.
+  markets, news, Hacker News, GitHub, OLX, eBay, financial data. *Done — the
+  **AI** tab's model gets every data source in the app as a tool: the treg
+  catalog and any endpoint (async included), web search/extract, X, Reddit,
+  News (free RSS + treg search), Hacker News (free), GitHub (free), OLX.pt
+  (free), eBay (paid through treg) and Markets/crypto (yfinance), with native
+  OpenAI tool calling and a JSON fallback. See README.* The MCP-server idea
+  below is still open, to expose the same tools to any external MCP client.
 
 ## Classifieds
 
@@ -53,6 +53,13 @@ arrives as a tab plus its AI tools.
   treg calls, no charges). **Ask AI** judges a listing, **AI digest**
   summarizes the list, and the `olx_*` tools are in the AI registry (see
   README).*
+- **eBay** — a marketplace frontend: search listings by keyword or category,
+  open a listing by product id or URL for full detail, then an AI hand-off.
+  *Done — the eBay tab is in the app, routed through treg's paid SerpApi eBay
+  endpoints ($0.015 per search and per listing detail). **Full listing**
+  fetches item specifics and description, **Ask AI** judges a listing, **AI
+  digest** summarizes the list, and the `ebay_*` tools are in the AI registry
+  (see README).*
 
 ## Interface
 
@@ -60,8 +67,8 @@ arrives as a tab plus its AI tools.
   open a repo, look up a ticker, or ask the AI.
   *Done — the **Ctrl+K** palette is in the app, with an **Ask AI** action for
   arbitrary text (see README).*
-- **Tab shortcuts** — Alt+1…Alt+9, Alt+0 (and Alt+Shift+1/2/3 for the last
-  three) switch tabs from anywhere, including while typing.
+- **Tab shortcuts** — Alt+1…Alt+9, Alt+0 (and Alt+Shift+1/2/3/4 for the last
+  four) switch tabs from anywhere, including while typing.
   *Done — wired into the window with unshifted-keyval matching so Shift+digit
   works on any layout; tab tooltips and the palette list the shortcut.*
 - **Streaming answers + Stop** — stream the local model's tokens into the AI
