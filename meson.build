@@ -1,6 +1,6 @@
 project(
   'treg-console',
-  version: '1.0.0',
+  version: '1.1.0',
   license: 'MIT',
   meson_version: '>=1.8.0',
 )
@@ -18,6 +18,7 @@ install_data(
   'treg_console/app.py',
   'treg_console/client.py',
   'treg_console/markets.py',
+  'treg_console/news.py',
   'treg_console/desktop.py',
   'treg_console/icon.png',
   install_dir: pkgdir,

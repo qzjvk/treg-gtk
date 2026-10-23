@@ -16,6 +16,9 @@ catalog already has coverage it's noted; the rest is to build.
   with price and margin charts (see README).*
 - **News** — search and aggregate news, then sort it out: dedupe, rank, and
   summarize with the local model.
+  *Done — the News tab is in the app: Top/Tech/Business aggregate free RSS
+  feeds (deduped and ranked), Search goes through treg, Read article fetches
+  the full text, and Digest summarizes with the local model (see README).*
 - **AI over all of it (MCP)** — an AI that can look at all of the above:
   reddit, markets, news, financial data. Expose the data as MCP tools by
   extending the current treg backend a bit, so the app's model — or any MCP

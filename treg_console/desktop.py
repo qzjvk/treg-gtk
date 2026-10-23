@@ -20,7 +20,7 @@ APP_ID = "treg.console"  # must match the GApplication id in app.py
 CMD_NAME = "treg-console"  # installed launcher command
 ICON_NAME = "treg-console"  # icon name in the hicolor theme
 APP_NAME = "treg console"
-APP_COMMENT = "Desktop console for the treg tool catalog — search, call, audit 4,000+ endpoints, and summarize web results with an LLM"
+APP_COMMENT = "Desktop console for the treg tool catalog — search, news, markets, social frontends, endpoints, and LLM summaries"
 ICON_SRC = Path(__file__).parent / "icon.png"
 
 

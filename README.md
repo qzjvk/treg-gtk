@@ -3,8 +3,8 @@
 A native Linux desktop app (GTK3) that uses [treg](https://treg.to) as its
 backend. The simple path is the **Browse** tab: search the web, click a
 result, and read the page. Under the hood it's a full console — X (Twitter)
-and Reddit frontends, a 4,000+ endpoint catalog, live calls with cost, and
-the team's call audit log.
+and Reddit frontends, a news front page, market data, a 4,000+ endpoint
+catalog, live calls with cost, and the team's call audit log.
 
 ## The goal
 
@@ -141,6 +141,16 @@ treg-console --no-desktop           # start without touching it
   call; select a coin, or enter a ticker or name, for its quote and
   90-day chart). Charts are plain Cairo in the theme's colors — no chart
   library.
+- **News** — a news front page. **Top**, **Tech** and **Business**
+  aggregate public RSS feeds directly (BBC, NPR, Al Jazeera, Guardian, NYT,
+  Ars Technica, TechCrunch, Wired, Hacker News, CNBC, MarketWatch, FT):
+  duplicates across outlets are merged, and stories are ranked by
+  corroboration, recency and feed position. No treg calls, no charges,
+  works without a token. **Search** runs an arbitrary query through treg's
+  routed news search. Select a story for its snippet and image,
+  **Read article** fetches the full text with treg's web extract, **Open in
+  browser** hands it to the desktop, and **Digest** summarizes the current
+  list with the local model.
 
 ## Credentials
 
@@ -157,6 +167,13 @@ treg_console/
   app.py               the GUI (tabs, worker threads, async polling, charts)
   client.py            synchronous REST client for the treg API
   markets.py           yfinance data source for the Markets tab (free, direct)
+  news.py              RSS aggregation, dedupe/ranking and treg search for News
   desktop.py           .desktop + icon installation (user XDG dirs)
   icon.png             app icon
+```
+
+Tests for the News feed parsing and ranking live in `tests/`:
+
+```sh
+python3 -m unittest discover -s tests -v
 ```

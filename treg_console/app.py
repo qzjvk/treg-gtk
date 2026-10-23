@@ -24,6 +24,9 @@ Tabs:
   Markets  — market data: live stock quotes, daily price history, company
              fundamentals, and crypto. Backed by yfinance (free, direct —
              no treg calls, no charges), with price and margin charts
+  News     — a news front page: Top, Tech and Business aggregate free RSS
+             feeds (deduped and ranked), Search goes through treg. Read the
+             full article or digest the current stories with the local model
 
 Credentials come from the treg CLI config (~/.treg/config.json) or TREG_TOKEN.
 """
@@ -53,6 +56,8 @@ from .client import TregClient, TregError, load_credentials
 from .desktop import install_desktop_entry, remove_desktop_entry
 from .markets import (MAJOR_COINS, yf_coins, yf_crypto_quote, yf_fundamentals,
                       yf_history, yf_quote)
+from .news import (TOPIC_LABELS as NEWS_TOPIC_LABELS, digest_prompt,
+                   fetch_topic, relative_time as news_when, search_news)
 
 MICRO = 1_000_000
 
@@ -283,6 +288,10 @@ def _reddit_call(client: TregClient, target: str, method: str,
 # ---------------------------------------------------------------------------
 
 _M_MARKET_MODES = ("stock", "history", "fundamentals", "crypto")
+
+# News tab: topic views aggregate free RSS; "search" uses treg's routed
+# news search. The order matches the combo box.
+_NEWS_MODES = ("top", "tech", "business", "search")
 
 
 def _m_price(v) -> str:
@@ -947,6 +956,9 @@ class MainWindow(Gtk.ApplicationWindow):
         self._r_selected: dict | None = None
         self._m_bars: list[dict] = []
         self._m_coins: list[dict] = []
+        self._news_items: list[dict] = []
+        self._news_selected: dict | None = None
+        self._news_label = "News"
         self._md_links: dict[Gtk.TextView, list[tuple[int, int, str]]] = {}
 
         self._build_ui()
@@ -999,6 +1011,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.tabs.append_page(self._build_x_tab(), Gtk.Label(label="X"))
         self.tabs.append_page(self._build_reddit_tab(), Gtk.Label(label="Reddit"))
         self.tabs.append_page(self._build_markets_tab(), Gtk.Label(label="Markets"))
+        self.tabs.append_page(self._build_news_tab(), Gtk.Label(label="News"))
         self.tabs.set_current_page(0)
         root.pack_start(self.tabs, True, True, 0)
 
@@ -1481,6 +1494,86 @@ class MainWindow(Gtk.ApplicationWindow):
         btn_row.pack_start(self.m_history_btn, False, False, 0)
         btn_row.pack_start(self.m_fundamentals_btn, False, False, 0)
         w.pack_start(btn_row, False, False, 0)
+        return w
+
+    def _build_news_tab(self) -> Gtk.Widget:
+        """A news front page: Top/Tech/Business aggregate free RSS feeds
+        (deduped and ranked, no treg calls); Search uses treg's routed news
+        search. A story opens in the pane on the right, where it can be read
+        in full (treg web extract) or the current list can be digested by the
+        local model."""
+        w = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.news_mode = Gtk.ComboBoxText()
+        for label in ("Top", "Tech", "Business", "Search"):
+            self.news_mode.append_text(label)
+        self.news_mode.set_active(0)
+        self.news_mode.connect("changed", self._news_mode_changed)
+        self.news_entry = Gtk.Entry()
+        self.news_entry.set_placeholder_text("Top stories — no query needed")
+        self.news_entry.set_sensitive(False)
+        self.news_entry.connect("activate", lambda e: self._news_go())
+        self.news_limit = Gtk.SpinButton.new_with_range(5, 100, 5)
+        self.news_limit.set_value(25)
+        self.news_limit.set_size_request(64, -1)
+        self.news_limit.set_tooltip_text("stories to show")
+        go = Gtk.Button(label="Go")
+        go.connect("clicked", lambda b: self._news_go())
+        row.pack_start(self.news_mode, False, False, 0)
+        row.pack_start(self.news_entry, True, True, 0)
+        row.pack_start(self.news_limit, False, False, 0)
+        row.pack_start(go, False, False, 0)
+        w.pack_start(row, False, False, 0)
+
+        paned = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL)
+
+        self.news_store = Gtk.ListStore(str, str, str, str)
+        self.news_table = Gtk.TreeView(model=self.news_store)
+        for header, col_idx in (("Source", 0), ("Headline", 1),
+                                ("Time", 2), ("Also", 3)):
+            col = Gtk.TreeViewColumn(header, Gtk.CellRendererText(), text=col_idx)
+            if col_idx == 1:
+                col.set_expand(True)
+            self.news_table.append_column(col)
+        self.news_table.get_selection().connect(
+            "changed", lambda s: self._on_news_selected())
+        paned.pack1(self._scrolled(self.news_table), True, True)
+
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.news_image = Gtk.Image()
+        # show_all() must not reveal the empty image; show it when one loads
+        self.news_image.set_no_show_all(True)
+        right.pack_start(self.news_image, False, False, 0)
+        self.news_detail = self._textview()
+        self.news_detail.connect("button-press-event", self._md_link_click)
+        right.pack_start(self._scrolled(self.news_detail), True, True, 0)
+        paned.pack2(right, True, True)
+        paned.set_position(620)
+        w.pack_start(paned, True, True, 0)
+
+        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.news_read_btn = Gtk.Button(label="Read article")
+        self.news_read_btn.set_tooltip_text(
+            "fetch the full article with treg's web extract")
+        self.news_read_btn.set_sensitive(False)
+        self.news_read_btn.connect("clicked", lambda b: self._news_read())
+        self.news_open_btn = Gtk.Button(label="Open in browser")
+        self.news_open_btn.set_sensitive(False)
+        self.news_open_btn.connect("clicked", lambda b: self._news_open())
+        self.news_digest_btn = Gtk.Button(label="Digest")
+        self.news_digest_btn.set_tooltip_text(
+            f"Summarize the current stories with {SUMMARY_MODEL}")
+        self.news_digest_btn.set_sensitive(False)
+        self.news_digest_btn.connect("clicked", lambda b: self._news_digest())
+        btn_row.pack_start(self.news_read_btn, False, False, 0)
+        btn_row.pack_start(self.news_open_btn, False, False, 0)
+        btn_row.pack_start(self.news_digest_btn, False, False, 0)
+        w.pack_start(btn_row, False, False, 0)
+        self._render_md(
+            self.news_detail,
+            "*Choose **Top**, **Tech**, **Business** or **Search**, then press "
+            "**Go**. The topic views aggregate free feeds; search uses treg.*")
         return w
 
     # -- plumbing -------------------------------------------------------------
@@ -2880,6 +2973,249 @@ class MainWindow(Gtk.ApplicationWindow):
         self._spawn(_m_coin_worker, row["symbol"],
                     on_ok=self._m_coin_done,
                     on_fail=lambda m: self._error(f"coin: {m}"))
+
+    # -- News tab --------------------------------------------------------------
+
+    def _news_mode(self) -> str:
+        idx = self.news_mode.get_active()
+        return _NEWS_MODES[idx] if 0 <= idx < len(_NEWS_MODES) else "top"
+
+    def _news_mode_changed(self, combo):
+        mode = self._news_mode()
+        placeholders = {
+            "top": "Top stories — no query needed",
+            "tech": "Technology stories — no query needed",
+            "business": "Business stories — no query needed",
+            "search": "search the news — keyword or phrase…",
+        }
+        self.news_entry.set_placeholder_text(placeholders.get(mode, ""))
+        self.news_entry.set_sensitive(mode == "search")
+        if mode == "search":
+            self.news_entry.grab_focus()
+        self._news_items = []
+        self._news_selected = None
+        self._news_label = NEWS_TOPIC_LABELS.get(mode, "News")
+        self.news_store.clear()
+        self.news_image.set_from_pixbuf(None)
+        self.news_image.set_visible(False)
+        self.news_read_btn.set_sensitive(False)
+        self.news_open_btn.set_sensitive(False)
+        self.news_digest_btn.set_sensitive(False)
+        hint = (f"*{self._news_label} — press **Go** to load the stories.*"
+                if mode != "search" else
+                "*Type a query and press **Go** to search the news through treg.*")
+        self._render_md(self.news_detail, hint)
+
+    def _news_go(self):
+        mode = self._news_mode()
+        limit = int(self.news_limit.get_value())
+        if mode == "search":
+            if self.client is None:
+                self._error("news search needs a treg token — run `treg login`; "
+                            "Top, Tech and Business work without one")
+                return
+            q = self.news_entry.get_text().strip()
+            if not q:
+                self._error("enter a query to search the news")
+                return
+            self._busy(f"Searching news for “{q}”…")
+            self._spawn(search_news, self.client, q, limit,
+                        on_ok=lambda out: self._news_loaded(out, f"Search: {q}"),
+                        on_fail=lambda m: self._error(f"news search: {m}"))
+            return
+        label = NEWS_TOPIC_LABELS.get(mode, "News")
+        self._busy(f"Loading {label.lower()}…")
+        self._spawn(fetch_topic, mode, limit,
+                    on_ok=lambda out: self._news_loaded(out, label),
+                    on_fail=lambda m: self._error(f"news: {m}"))
+
+    def _news_loaded(self, out: dict, label: str):
+        self._news_label = label
+        self._news_items = out.get("items") or []
+        self._news_selected = None
+        self.news_store.clear()
+        for it in self._news_items:
+            sources = it.get("sources") or ([it.get("source")]
+                                            if it.get("source") else [])
+            self.news_store.append([
+                sources[0] if sources else "",
+                it.get("title") or "(untitled)",
+                news_when(it.get("ts"), it.get("published") or ""),
+                f"+{len(sources) - 1}" if len(sources) > 1 else "",
+            ])
+        self.news_image.set_from_pixbuf(None)
+        self.news_image.set_visible(False)
+        self.news_read_btn.set_sensitive(False)
+        self.news_open_btn.set_sensitive(False)
+        self.news_digest_btn.set_sensitive(bool(self._news_items))
+        if not self._news_items:
+            self._render_md(self.news_detail,
+                            f"*{label} returned no stories — try again.*")
+            self._error(f"no news stories for {label}")
+            return
+        self._render_md(
+            self.news_detail,
+            f"**{label}** — {len(self._news_items)} stories\n\n"
+            "*Select a story to see it here, **Read article** to fetch the "
+            "full text, or **Digest** to summarize the list with "
+            f"{SUMMARY_MODEL}.*")
+        bits = [f"{len(self._news_items)} stories"]
+        if out.get("feeds"):
+            bits.append(f"from {out['feeds']} feeds")
+        if out.get("served_by"):
+            bits.append(f"via {out['served_by']}")
+        if out.get("cost_micro") is not None:
+            bits.append(f"charged {usd(out['cost_micro'])}")
+        errors = out.get("errors") or []
+        if errors:
+            bits.append(f"{len(errors)} feed(s) unavailable")
+        self._busy(" · ".join(bits))
+
+    def _on_news_selected(self):
+        model, treeiter = self.news_table.get_selection().get_selected()
+        if treeiter is None:
+            return
+        idx = model.get_path(treeiter).get_indices()[0]
+        if idx >= len(self._news_items):
+            return
+        self._news_selected = self._news_items[idx]
+        self._news_render_detail()
+
+    def _news_render_detail(self):
+        p = self._news_selected
+        if not p:
+            return
+        sources = p.get("sources") or []
+        lines = [f"**{p.get('title') or '(untitled)'}**", ""]
+        meta = [s for s in (p.get("source_label") or p.get("source"),
+                            news_when(p.get("ts"), p.get("published") or ""))
+                if s]
+        if meta:
+            lines.append(" · ".join(_esc(m) for m in meta))
+        if len(sources) > 1:
+            lines.append(f"Also covered by: {_esc(', '.join(sources[1:]))}")
+        if p.get("snippet"):
+            lines += ["", _esc(p["snippet"])]
+        lines += ["", f"[Open the article]({p.get('url') or ''})"]
+        self._render_md(self.news_detail, "\n".join(lines))
+        self.news_read_btn.set_sensitive(
+            bool(p.get("url") and self.client is not None))
+        self.news_open_btn.set_sensitive(bool(p.get("url")))
+        self._news_show_image(p)
+
+    def _news_show_image(self, p: dict):
+        if not p.get("image"):
+            self.news_image.set_from_pixbuf(None)
+            self.news_image.set_visible(False)
+            return
+        self._spawn(_fetch_image, p["image"],
+                    on_ok=self._news_image_loaded,
+                    on_fail=self._news_image_failed)
+
+    def _news_image_failed(self, _msg: str):
+        self.news_image.set_from_pixbuf(None)
+        self.news_image.set_visible(False)
+
+    def _news_image_loaded(self, data):
+        if not data:
+            self._news_image_failed("")
+            return
+        stream = Gio.MemoryInputStream.new_from_bytes(GLib.Bytes.new(data))
+        try:
+            pixbuf = GdkPixbuf.Pixbuf.new_from_stream(stream, None)
+        except GLib.Error:
+            self._news_image_failed("")
+            return
+        w, h = pixbuf.get_width(), pixbuf.get_height()
+        if w > 560:
+            pixbuf = pixbuf.scale_simple(560, max(1, int(h * 560 / w)),
+                                         GdkPixbuf.InterpType.BILINEAR)
+        self.news_image.set_from_pixbuf(pixbuf)
+        self.news_image.set_visible(True)
+
+    def _news_read(self):
+        p = self._news_selected
+        if not p or not p.get("url"):
+            return
+        if self.client is None:
+            self._error("reading an article needs a treg token — run `treg login`")
+            return
+        url = p["url"]
+        self.news_read_btn.set_sensitive(False)
+        self._busy(f"Reading {url}…")
+        self._spawn(self.client.call, "treg.web.extract", "POST", None,
+                    json.dumps({"url": url}),
+                    on_ok=lambda r: self._news_read_done(url, r),
+                    on_fail=self._news_read_failed)
+
+    def _news_read_failed(self, msg: str):
+        self.news_read_btn.set_sensitive(True)
+        self._error(f"read: {msg}")
+
+    def _news_read_done(self, url: str, r: httpx.Response):
+        self.news_read_btn.set_sensitive(True)
+        try:
+            body = r.json()
+        except ValueError:
+            body = None
+        p = self._news_selected or {}
+        head = f"# {p.get('title') or 'Article'}\n\n"
+        meta = [s for s in (p.get("source_label") or p.get("source"),
+                            news_when(p.get("ts"), p.get("published") or ""))
+                if s]
+        if meta:
+            head += f"*{' · '.join(_esc(m) for m in meta)}*\n\n"
+        if r.status_code >= 400 or body is None:
+            detail = body.get("detail", "") if isinstance(body, dict) else ""
+            reason = _esc(detail) if detail else f"HTTP {r.status_code}"
+            self._render_md(self.news_detail,
+                            head + f"*(could not read the article) {reason}*")
+            self._error(f"read: HTTP {r.status_code}")
+            return
+        bits = [url]
+        if r.headers.get("X-Treg-Served-By"):
+            bits.append(f"via {r.headers['X-Treg-Served-By']}")
+        if r.headers.get("X-Treg-Cost-Micro") is not None:
+            bits.append(f"charged {usd(int(r.headers['X-Treg-Cost-Micro']))}")
+        self._render_md(self.news_detail, head + _page_markdown(body),
+                        base_url=url)
+        self._busy(" · ".join(bits))
+
+    def _news_open(self):
+        p = self._news_selected
+        if p and p.get("url"):
+            try:
+                Gio.AppInfo.launch_default_for_uri(p["url"], None)
+            except GLib.Error as e:
+                self._error(f"could not open {p['url']}: {e.message}")
+
+    def _news_digest(self):
+        rows = self._news_items
+        if not rows:
+            self._error("load some stories first, then press Digest")
+            return
+        self.news_digest_btn.set_sensitive(False)
+        self._render_md(self.news_detail,
+                        f"*Digesting {min(len(rows), 12)} stories with "
+                        f"{SUMMARY_MODEL} …*")
+        self._busy(f"Writing a digest with {SUMMARY_MODEL} …")
+        self._spawn(_complete, digest_prompt(self._news_label, rows),
+                    on_ok=self._news_digest_done,
+                    on_fail=self._news_digest_failed)
+
+    def _news_digest_done(self, text: str):
+        self.news_digest_btn.set_sensitive(bool(self._news_items))
+        body = text or "(the model returned an empty digest)"
+        self._render_md(self.news_detail,
+                        f"# News digest\n\n{body}\n\n"
+                        f"*{min(len(self._news_items), 12)} stories · "
+                        f"{SUMMARY_MODEL}*")
+        self._busy(f"Digest ready ({SUMMARY_MODEL})")
+
+    def _news_digest_failed(self, msg: str):
+        self.news_digest_btn.set_sensitive(bool(self._news_items))
+        self._render_md(self.news_detail, f"*(digest failed) {_esc(msg)}*")
+        self._error(f"digest: {msg}")
 
     # -- shutdown --------------------------------------------------------------------
 
