@@ -4,17 +4,22 @@ A native Linux desktop app (GTK3) that uses [treg](https://treg.to) as its
 backend. The simple path is the **Browse** tab: search the web, click a
 result, and read the page. Under the hood it's a full console — X (Twitter)
 and Reddit frontends, a news front page, market data, a 4,000+ endpoint
-catalog, live calls with cost, and the team's call audit log.
+catalog, live calls with cost, and an **AI** tab whose model can call all of
+it as tools.
 
 ## The goal
 
 The treg console is meant to become the **everything app** — one native
 window that is your gateway to the internet: search the web and read pages,
-summarize anything with a local model, browse social platforms (X and Reddit
-today, more as treg's catalog grows), and call any of treg's 4,000+ endpoints — all
-with live cost, without leaving the desktop. treg's catalog (113 platforms,
-new providers all the time) is the backend that makes this possible: every
-platform or service treg can reach is a frontend this app can add next.
+browse social platforms (X and Reddit today, more as treg's catalog grows),
+read the news, watch markets, and call any of treg's 4,000+ endpoints — all
+with live cost, without leaving the desktop. An **AI interaction** tab ties
+it together: the local model can use every one of those data sources as a
+tool, so one question can search the catalog, read a page, scan news and
+check markets in a single turn. treg's catalog (113 platforms, new providers
+all the time) is the backend that makes this possible: every platform or
+service treg can reach is a frontend this app can add next.
+
 
 ## Native look
 
@@ -31,6 +36,9 @@ desktop environment shows the right icon and groups the window with the app.
   work without it)
 - meson ≥ 1.8 and ninja (for installing)
 - a treg login: `treg login` (writes `~/.treg/config.json`), or `TREG_TOKEN`
+- an OpenAI-compatible chat server for the AI tab (default
+  `http://localhost:5000/v1`; native tool calling is used when the server
+  supports it)
 
 ## Run from a checkout
 
@@ -86,20 +94,22 @@ treg-console --no-desktop           # start without touching it
 
 - **Browse** — the simple path: type a query, hit Search, click a result. The
   page is fetched with treg's web-extract tool and shown as clean Markdown
-  (one search + one page read, ~$0.0002). **Summarize** sends the current
-  results to the **Summarize** tab — no treg charge.
-- **Summarize** — the current Browse results (all of them, default 8) sent
-  to an OpenAI-compatible `/v1/completions` endpoint (default
-  `http://localhost:5000/v1`, model `qwen3.8-27B-3.5bpw`); the 3-5 sentence
-  summary appears in this tab. The **Ask further** box below it is a chat:
-  your question shows as a bold "You — …" line and the answer renders below
-  it, so the thread stacks as you ask more. Page content, summaries and
-  answers are all rendered as Markdown (the model is asked to answer in
-  Markdown); links open in the default browser.
-
-  The endpoint, key and model default to the local server; override with
-  `SUMMARY_URL`, `SUMMARY_API_KEY` and `TREG_SUMMARY_MODEL` if you run it
-  elsewhere.
+  (one search + one page read, ~$0.0002). **Ask AI** hands the current
+  results to the **AI** tab.
+- **AI** — AI interaction: a chat with the local model (default
+  `http://localhost:5000/v1`, model `qwen3.8-27B-3.5bpw`). The model has
+  **tools for everything in the app** and calls them itself: search treg's
+  catalog and call *any* endpoint (`treg_call`, async tasks polled), search
+  the web and read pages, search X and load replies/profiles, search Reddit
+  and load comments/profiles, read the news (free RSS) or search it through
+  treg, and pull stock quotes, history, fundamentals and crypto from
+  yfinance. Tool calls appear inline (`→ tool_name(...)` / `← result`) and
+  answers render as Markdown with clickable links; the conversation is kept
+  for follow-ups until **New chat**. Native OpenAI tool calling is used when
+  the server supports it, otherwise the agent falls back to a fenced-JSON
+  tool protocol. Configure with `AI_URL`, `AI_API_KEY` and `TREG_AI_MODEL`
+  (the old `SUMMARY_URL` / `SUMMARY_API_KEY` / `TREG_SUMMARY_MODEL` names
+  still work).
 - **Catalog** — search the catalog by task ("backlinks for a domain"),
   inspect an endpoint's parameters, price, reliability and sibling providers,
   then jump straight to a call.
@@ -116,7 +126,8 @@ treg-console --no-desktop           # start without touching it
   `#hashtag`, `from:user`), **User** (an account's recent posts by handle)
   and **Trends** (trending topics by country — pick one to search it).
   Select a post for its full text, media image, stats and a link out to X;
-  **Replies** loads the thread, **Profile** loads the author's profile.
+  **Replies** loads the thread, **Profile** loads the author's profile,
+  **Ask AI** hands the post to the AI.
   Posts come from treg's routed `x.*` endpoints — each view costs a fraction
   of a cent, and the charge shows in the status bar.
 - **Reddit** — a Reddit frontend. Three modes: **Search** (a keyword or
@@ -128,7 +139,7 @@ treg-console --no-desktop           # start without touching it
   enriches it (Markdown body, media, flair); if that call misses, the feed
   data stays on screen. Posts come from treg-routed Reddit endpoints —
   each view costs a fraction of a cent, and the charge shows in the status
-  bar.
+  bar. **Ask AI** hands the post to the AI.
 - **Markets** — market data backed by **yfinance** (Yahoo Finance, direct
   and free — no treg calls, no charges, works without a treg token). Four
   modes: **Stock** (a live quote — price, change, day range, volume, market
@@ -140,7 +151,7 @@ treg-console --no-desktop           # start without touching it
   bar chart), and **Crypto** (major coins' latest prices in one batched
   call; select a coin, or enter a ticker or name, for its quote and
   90-day chart). Charts are plain Cairo in the theme's colors — no chart
-  library.
+  library. **Ask AI** analyzes whatever is on screen.
 - **News** — a news front page. **Top**, **Tech** and **Business**
   aggregate public RSS feeds directly (BBC, NPR, Al Jazeera, Guardian, NYT,
   Ars Technica, TechCrunch, Wired, Hacker News, CNBC, MarketWatch, FT):
@@ -149,13 +160,16 @@ treg-console --no-desktop           # start without touching it
   works without a token. **Search** runs an arbitrary query through treg's
   routed news search. Select a story for its snippet and image,
   **Read article** fetches the full text with treg's web extract, **Open in
-  browser** hands it to the desktop, and **Digest** summarizes the current
-  list with the local model.
+  browser** hands it to the desktop, **AI digest** summarizes the current
+  list in the AI tab, and **Ask AI** explains the selected story.
 
 ## Credentials
 
 Read from `~/.treg/config.json` (what `treg login` writes), overridable with
 `TREG_TOKEN` / `TREG_URL`.
+
+The AI endpoint is configured with `AI_URL` / `AI_API_KEY` / `TREG_AI_MODEL`
+(and falls back to the older `SUMMARY_*` names).
 
 ## Layout
 
@@ -164,15 +178,18 @@ meson.build            meson project (package, command, .desktop, icon)
 pyproject.toml         meson-python build config (pip install .)
 data/                  .desktop entry + launcher script
 treg_console/
-  app.py               the GUI (tabs, worker threads, async polling, charts)
-  client.py            synchronous REST client for the treg API
-  markets.py           yfinance data source for the Markets tab (free, direct)
+  app.py               the GUI (tabs, worker threads, charts, AI tab wiring)
+  ai.py                AI agent: tool registry (treg/web/X/Reddit/news/markets)
+                       and the native + fallback tool-calling loop
+  client.py            synchronous REST client for the treg API + async polling
+  parsing.py           response normalization shared by the tabs and the tools
+  markets.py           yfinance data source for the Markets tab and AI tools
   news.py              RSS aggregation, dedupe/ranking and treg search for News
   desktop.py           .desktop + icon installation (user XDG dirs)
   icon.png             app icon
 ```
 
-Tests for the News feed parsing and ranking live in `tests/`:
+Tests for the News feed parsing/ranking and the AI agent live in `tests/`:
 
 ```sh
 python3 -m unittest discover -s tests -v

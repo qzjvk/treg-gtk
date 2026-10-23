@@ -1,6 +1,6 @@
 project(
   'treg-console',
-  version: '1.1.0',
+  version: '1.2.0',
   license: 'MIT',
   meson_version: '>=1.8.0',
 )
@@ -15,10 +15,12 @@ pkgdir = py.get_install_dir(pure: true) / 'treg_console'
 install_data(
   'treg_console/__init__.py',
   'treg_console/__main__.py',
+  'treg_console/ai.py',
   'treg_console/app.py',
   'treg_console/client.py',
   'treg_console/markets.py',
   'treg_console/news.py',
+  'treg_console/parsing.py',
   'treg_console/desktop.py',
   'treg_console/icon.png',
   install_dir: pkgdir,

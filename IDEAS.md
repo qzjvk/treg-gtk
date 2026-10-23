@@ -19,10 +19,13 @@ catalog already has coverage it's noted; the rest is to build.
   *Done — the News tab is in the app: Top/Tech/Business aggregate free RSS
   feeds (deduped and ranked), Search goes through treg, Read article fetches
   the full text, and Digest summarizes with the local model (see README).*
-- **AI over all of it (MCP)** — an AI that can look at all of the above:
-  reddit, markets, news, financial data. Expose the data as MCP tools by
-  extending the current treg backend a bit, so the app's model — or any MCP
-  client — can query everything through one interface.
+- **AI over all of it** — an AI that can look at all of the above: reddit,
+  markets, news, financial data. *Done — the **AI** tab's model gets every
+  data source in the app as a tool: the treg catalog and any endpoint (async
+  included), web search/extract, X, Reddit, News (free RSS + treg search) and
+  Markets/crypto (yfinance), with native OpenAI tool calling and a JSON
+  fallback. See README.* The MCP-server idea below is still open, to expose
+  the same tools to any external MCP client.
 
 ## More platform frontends
 

@@ -8,9 +8,9 @@ application.
 
 Tabs:
   Browse   — search the web, click a result, read the page (the simple path)
-  Summarize — the current search results, summarized via an OpenAI-compatible
-             /v1/completions endpoint (localhost:5000 by default), with an
-             'Ask further' box for follow-up questions about the summary
+  AI       — AI interaction: chat with the local model, which can call every
+             data source in the app as a tool (treg catalog + any endpoint,
+             web, X, Reddit, News, Markets) and answer in Markdown
   Catalog  — search the 4,000+ endpoint catalog, inspect params/price/reliability
   Providers — browse the platform catalog by category, drill into a
              platform's capabilities and endpoints
@@ -26,15 +26,16 @@ Tabs:
              no treg calls, no charges), with price and margin charts
   News     — a news front page: Top, Tech and Business aggregate free RSS
              feeds (deduped and ranked), Search goes through treg. Read the
-             full article or digest the current stories with the local model
+             full article or hand the current stories to the AI
 
 Credentials come from the treg CLI config (~/.treg/config.json) or TREG_TOKEN.
+The AI endpoint is OpenAI-compatible; configure it with AI_URL, AI_API_KEY
+and TREG_AI_MODEL (SUMMARY_* still works as a fallback).
 """
 
 from __future__ import annotations
 
 import json
-import os
 import re
 import sys
 import threading
@@ -52,21 +53,22 @@ from gi.repository import Gio, GLib, Gdk, GdkPixbuf, Gtk, Pango
 import cairo
 import httpx
 
-from .client import TregClient, TregError, load_credentials
+from .ai import (AI_MODEL, AI_URL, run_agent, tool_summary)
+from .client import TregClient, TregError, load_credentials, poll_async_task
 from .desktop import install_desktop_entry, remove_desktop_entry
 from .markets import (MAJOR_COINS, yf_coins, yf_crypto_quote, yf_fundamentals,
                       yf_history, yf_quote)
 from .news import (TOPIC_LABELS as NEWS_TOPIC_LABELS, digest_prompt,
                    fetch_topic, relative_time as news_when, search_news)
+from .parsing import (call_error as _call_error, page_markdown as _page_markdown,
+                      pretty_json, reddit_call as _reddit_call,
+                      reddit_norm_post as _reddit_norm_post,
+                      reddit_posts_of as _reddit_posts_of,
+                      reddit_when as _reddit_when,
+                      search_results as _search_results,
+                      x_norm_post as _x_norm_post, x_when as _x_when)
 
 MICRO = 1_000_000
-
-# Summarizer for the Browse tab: an OpenAI-compatible /v1/completions
-# endpoint. Override with SUMMARY_URL / SUMMARY_API_KEY / TREG_SUMMARY_MODEL
-# if you run it elsewhere.
-SUMMARY_URL = os.environ.get("SUMMARY_URL", "http://localhost:5000/v1")
-SUMMARY_API_KEY = os.environ.get("SUMMARY_API_KEY", "7dce0de9cc98b5af9b0f59e7a22d4ab8")
-SUMMARY_MODEL = os.environ.get("TREG_SUMMARY_MODEL", "qwen3.8-27B-3.5bpw")
 
 
 def usd(micro: int | float | None) -> str:
@@ -82,44 +84,6 @@ def usd_amount(value: int | float | None) -> str:
     if value is None:
         return "—"
     return f"${value:,.6f}".rstrip("0").rstrip(".") if value else "$0"
-
-
-def _x_norm_post(p: dict) -> dict:
-    """Normalize one provider-native X post row to the tab's fixed shape.
-    Providers use different key styles (likes vs likeCount, authorHandle vs
-    authorUsername), so take the first key that is present."""
-    def first(*keys):
-        for k in keys:
-            v = p.get(k)
-            if v is not None:
-                return v
-        return None
-    pid = str(first("id", "tweet_id", "status_id") or "")
-    url = first("url") or (f"https://x.com/i/web/status/{pid}" if pid else "")
-    media = [m.get("url") for m in (first("media") or [])
-             if isinstance(m, dict) and m.get("url")]
-    return {
-        "id": pid,
-        "text": first("text", "full_text") or "",
-        "url": url,
-        "author_name": first("authorName", "name") or "",
-        "author_handle": first("authorHandle", "authorUsername", "screen_name") or "",
-        "created": first("createdUtc", "created_at", "created"),
-        "likes": first("likes", "likeCount") or 0,
-        "retweets": first("retweets", "retweetCount") or 0,
-        "replies": first("replies", "replyCount") or 0,
-        "views": first("views", "viewCount") or 0,
-        "media": media,
-        "is_reply": bool(first("isReply", "is_reply")),
-    }
-
-
-def _x_when(created) -> str:
-    if created is None:
-        return ""
-    if isinstance(created, (int, float)) and not isinstance(created, bool):
-        return time.strftime("%Y-%m-%d %H:%M", time.gmtime(created))
-    return str(created)
 
 
 def _count(v) -> str:
@@ -140,146 +104,6 @@ def _fetch_image(url: str) -> bytes | None:
         return r.content
     except httpx.HTTPError:
         return None
-
-
-# ---------------------------------------------------------------------------
-# Reddit tab helpers
-# ---------------------------------------------------------------------------
-
-def _reddit_norm_post(p: dict) -> dict:
-    """Normalize one Reddit post row to the tab's fixed shape. Two native
-    shapes exist: the app's SubredditPost objects (postTitle, content,
-    authorInfo) and scrapecreators' flat rows (title, selftext, author)."""
-    def first(*keys):
-        for k in keys:
-            v = p.get(k)
-            if v is not None:
-                return v
-        return None
-    pid = str(first("name", "id") or "")
-    if pid and not pid.startswith("t3_"):
-        pid = f"t3_{pid}"  # the tikhub endpoints need the fullname
-    author = first("author")
-    if not author:
-        author = ((p.get("authorInfo") or {}).get("name")) or ""
-    sub = p.get("subreddit")
-    if isinstance(sub, dict):
-        sub = sub.get("prefixedName") or sub.get("name") or ""
-    else:
-        sub = sub or ""
-    if sub and not sub.startswith("r/"):
-        sub = f"r/{sub}"
-    flair = p.get("flair")
-    flair = flair.get("text") if isinstance(flair, dict) else p.get("link_flair_text")
-    permalink = first("permalink")
-    url = first("url") or (f"https://www.reddit.com{permalink}" if permalink else "")
-    return {
-        "id": pid,
-        "title": first("title", "postTitle") or "",
-        "body": first("selftext") or ((p.get("content") or {}).get("markdown")) or "",
-        "author": author,
-        "subreddit": sub,
-        "created": first("created_utc", "createdAt"),
-        "score": first("score") or 0,
-        "comments": first("num_comments", "commentCount") or 0,
-        "url": url or "",
-        "flair": flair or "",
-        "self_post": bool(first("isSelfPost")) or str(first("domain") or "").startswith("self."),
-        "image": _reddit_post_image(p),
-    }
-
-
-def _reddit_when(created) -> str:
-    if created is None:
-        return ""
-    if isinstance(created, (int, float)) and not isinstance(created, bool):
-        return time.strftime("%Y-%m-%d %H:%M", time.gmtime(created))
-    m = re.match(r"(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})", str(created))
-    return f"{m.group(1)} {m.group(2)}" if m else str(created)
-
-
-def _reddit_post_image(p: dict) -> str | None:
-    """First image URL of a post: the media still, a gallery image, or the
-    thumbnail. Self (text) posts have no image."""
-    if p.get("isSelfPost"):
-        return None
-    m = p.get("media")
-    if isinstance(m, dict):
-        still = (m.get("still") or {}).get("source")
-        if isinstance(still, dict) and still.get("url"):
-            return still["url"]
-        images = m.get("images")
-        if isinstance(images, list) and images and isinstance(images[0], dict):
-            src = (images[0].get("source") or {}).get("url")
-            if src:
-                return src
-    t = p.get("thumbnail")
-    if isinstance(t, dict) and t.get("url"):
-        return t["url"]
-    if isinstance(t, str) and t:
-        return t
-    return None
-
-
-def _reddit_posts_of(body: object) -> list[dict]:
-    """Extract post rows from the three Reddit response shapes:
-    scrapecreators' flat `posts`, the dynamic search's edge/children posts,
-    and the user feed's edge nodes."""
-    if not isinstance(body, dict):
-        return []
-    if isinstance(body.get("posts"), list):
-        return [p for p in body["posts"] if isinstance(p, dict)]
-    data = body.get("data")
-    if not isinstance(data, dict):
-        return []
-    posts: list[dict] = []
-    search = data.get("search")
-    main = (((search or {}).get("dynamic") or {}).get("components") or {}).get("main") or {}
-    for edge in main.get("edges") or []:
-        if not isinstance(edge, dict):
-            continue
-        node = edge.get("node") or {}
-        children = node.get("children") if isinstance(node, dict) else None
-        for child in children if children is not None else (edge.get("children") or []):
-            if isinstance(child, dict) and isinstance(child.get("post"), dict):
-                posts.append(child["post"])
-    feed = (data.get("postFeed") or {}).get("elements") or {}
-    for edge in feed.get("edges") or []:
-        if isinstance(edge, dict) and isinstance(edge.get("node"), dict):
-            posts.append(edge["node"])
-    return posts
-
-
-def _call_error(r: httpx.Response) -> str | None:
-    """Error text when a /call response came back with an error status
-    (providers return 200 for real misses, but upstream failures like
-    tikhub's 400 "please retry" arrive as error statuses). Else None."""
-    if r.status_code < 400:
-        return None
-    try:
-        body = r.json()
-    except ValueError:
-        return f"HTTP {r.status_code}"
-    detail = body.get("detail") if isinstance(body, dict) else None
-    if isinstance(detail, dict):
-        return str(detail.get("message") or json.dumps(detail)[:200])
-    if detail:
-        return str(detail)
-    return f"HTTP {r.status_code}: {str(body)[:200]}"
-
-
-def _reddit_call(client: TregClient, target: str, method: str,
-                 params: list[tuple[str, str]] | None,
-                 body: str | None) -> httpx.Response:
-    """One Reddit call with a single retry after 2s. The providers (notably
-    tikhub) intermittently fail with 400 "please retry", and treg's routing
-    502s when every candidate for a team tool misses — a short retry
-    usually clears both. Runs in a worker thread."""
-    r = client.call(target, method, params, body)
-    if _call_error(r) is not None:
-        time.sleep(2.0)
-        r = client.call(target, method, params, body)
-    return r
 
 
 # ---------------------------------------------------------------------------
@@ -384,13 +208,6 @@ def _m_coin_worker(query: str) -> dict:
     return {"quote": q, "name": sym, "bars": yf_history(f"{sym}-USD", 90)}
 
 
-def pretty_json(obj: object) -> str:
-    try:
-        return json.dumps(obj, indent=2, ensure_ascii=False)
-    except (TypeError, ValueError):
-        return str(obj)
-
-
 def _markup_escape(s: str) -> str:
     """Escape &, < and > for Pango markup (pango_markup_escape_text is not
     exposed in the PyGObject binding)."""
@@ -405,8 +222,8 @@ def _esc(s: object) -> str:
 # ---------------------------------------------------------------------------
 # Markdown → Pango markup (practical subset, dependency-free)
 #
-# Used by the Browse page view, the Summarize pane and the 'Ask further'
-# chat: headings, bold/italic, inline code, fenced code blocks, links,
+# Used by the Browse page view, the AI tab and the detail panes:
+# headings, bold/italic, inline code, fenced code blocks, links,
 # lists, blockquotes and horizontal rules.
 # ---------------------------------------------------------------------------
 
@@ -491,49 +308,7 @@ def _set_buffer_markup(buffer: Gtk.TextBuffer, markup: str):
 
 
 # ---------------------------------------------------------------------------
-# browse-tab response parsing
-# ---------------------------------------------------------------------------
-
-def _search_results(body: object) -> list[dict]:
-    """Normalise a treg.web.search response to a list of {title,url,snippet}."""
-    out = body.get("output", body) if isinstance(body, dict) else body
-    if isinstance(out, dict):
-        rows = out.get("results") or out.get("items") or out.get("organic") or []
-    elif isinstance(out, list):
-        rows = out
-    else:
-        rows = []
-    norm = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        url = row.get("url") or row.get("link") or row.get("href") or ""
-        title = row.get("title") or row.get("name") or url
-        snippet = (row.get("snippet") or row.get("description")
-                   or row.get("content") or "")
-        norm.append({"title": str(title), "url": str(url), "snippet": str(snippet)})
-    return norm
-
-
-def _page_markdown(body: object) -> str:
-    """Pull the page's Markdown text out of a treg.web.extract response."""
-    out = body.get("output", body) if isinstance(body, dict) else body
-    if isinstance(out, dict):
-        pages = out.get("pages")
-        if isinstance(pages, list) and pages and isinstance(pages[0], dict):
-            p = pages[0]
-            return str(p.get("markdown") or p.get("text")
-                       or p.get("content") or "")
-        for key in ("markdown", "text", "content", "html"):
-            if out.get(key):
-                return str(out[key])
-    if isinstance(out, str):
-        return out
-    return pretty_json(body)
-
-
-# ---------------------------------------------------------------------------
-# summarizer (OpenAI-compatible /v1/completions endpoint)
+# prompts for the Browse tab's AI button
 # ---------------------------------------------------------------------------
 
 def _results_block(query: str, rows: list[dict]) -> str:
@@ -544,182 +319,6 @@ def _results_block(query: str, rows: list[dict]) -> str:
         if r["snippet"]:
             lines.append(f"   {r['snippet']}")
     return "\n".join(lines)
-
-
-def _complete(prompt: str, model: str = SUMMARY_MODEL) -> str:
-    """One blocking call to the OpenAI-compatible /v1/completions endpoint."""
-    try:
-        r = httpx.post(f"{SUMMARY_URL}/completions",
-                       headers={"Authorization": f"Bearer {SUMMARY_API_KEY}"},
-                       json={"model": model, "prompt": prompt},
-                       timeout=180.0)
-    except httpx.ConnectError:
-        raise TregError(f"cannot reach the summarize endpoint at {SUMMARY_URL}")
-    if r.status_code >= 400:
-        raise TregError(
-            f"the summarize endpoint returned HTTP {r.status_code}: {r.text[:300]}",
-            status=r.status_code)
-    try:
-        data = r.json()
-    except ValueError:
-        raise TregError("the summarize endpoint returned non-JSON")
-    choices = data.get("choices") or []
-    if not choices or not isinstance(choices[0], dict):
-        raise TregError("the summarize endpoint returned no choices")
-    raw = str(choices[0].get("text", ""))
-    # The proxy prefixes the answer with a blank line, and the model is a
-    # thinking model: it emits its reasoning in a leading "think" block. In
-    # that case the answer follows the closing tag. The tags are built from
-    # parts so this source file stays free of the literal tag text.
-    open_tag = chr(60) + "think" + chr(62)
-    close_tag = chr(60) + "/think" + chr(62)
-    if raw.lstrip().startswith(open_tag):
-        parts = raw.rsplit(close_tag, 1)
-        return parts[1].strip() if len(parts) > 1 else "(the model stopped inside its reasoning block)"
-    return raw.strip()
-
-
-def summarize(query: str, rows: list[dict],
-              model: str = SUMMARY_MODEL) -> str:
-    """Summarize the Browse-tab search results (blocking)."""
-    prompt = (
-        "Summarize the web search results below in 3-5 sentences. "
-        "Write the answer in Markdown (use **bold** for emphasis and a short "
-        "list where it helps); cover what the results say about the query; "
-        "do not list URLs.\n\n"
-        + _results_block(query, rows)
-    )
-    return _complete(prompt, model)
-
-
-def ask_followup(query: str, rows: list[dict], summary: str, question: str,
-                 model: str = SUMMARY_MODEL) -> str:
-    """Answer a follow-up question about a previous summary (blocking)."""
-    prompt = (
-        "You are answering a follow-up question about a web search summary.\n\n"
-        + _results_block(query, rows) + "\n\n"
-        + f"Summary:\n{summary}\n\n"
-        + f"Question: {question}\n"
-        "Answer in 2-4 sentences, in Markdown (use **bold** for emphasis; "
-        "no headings)."
-    )
-    return _complete(prompt, model)
-
-
-# ---------------------------------------------------------------------------
-# async task polling (mirrors the treg CLI's descriptor semantics)
-# ---------------------------------------------------------------------------
-
-def _json_path(doc: object, dotted: str) -> object:
-    cur = doc
-    for part in dotted.split("."):
-        if isinstance(cur, dict):
-            cur = cur.get(part)
-        elif isinstance(cur, list) and part.isdigit() and int(part) < len(cur):
-            cur = cur[int(part)]
-        else:
-            return None
-    return cur
-
-
-def _classify(descriptor: dict, doc: object) -> str:
-    rule = descriptor.get("status") or {}
-    v = _json_path(doc, str(rule.get("path") or ""))
-    if v is None:
-        return "progress"
-    s = str(v)
-    if s in {str(x) for x in rule.get("success", [])}:
-        return "success"
-    if s in {str(x) for x in rule.get("billed_failure", [])}:
-        return "billed_failure"
-    if s in {str(x) for x in rule.get("failure", [])}:
-        return "failure"
-    return "progress"
-
-
-def poll_async_task(client: TregClient, descriptor: dict, submission: httpx.Response,
-                    on_progress, timeout: float = 900.0) -> dict:
-    """Follow one X-Treg-Async descriptor to its terminal state (blocking)."""
-    try:
-        submitted = submission.json()
-    except ValueError:
-        return {"error": "the async submission response is not JSON", "response": submission}
-
-    task_id = _json_path(submitted, str(descriptor.get("id_from") or ""))
-    if task_id in (None, ""):
-        return {"error": "submission response does not contain the async task id",
-                "response": submission}
-    task_id = str(task_id)
-
-    poll = descriptor.get("poll") or {}
-    if poll.get("endpoint"):
-        rule = poll["param"]
-        target, params = str(rule["in"]), [(str(rule["name"]), task_id)]
-    else:
-        url = _json_path(submitted, str(poll.get("url_from") or ""))
-        if not isinstance(url, str) or not url:
-            return {"error": "submission response does not contain the async poll URL",
-                    "response": submission}
-        target, params = url, []
-
-    interval = float(descriptor.get("interval") or 10)
-    max_age = descriptor.get("max_age")
-    if isinstance(max_age, (int, float)) and not isinstance(max_age, bool) and max_age > 0:
-        timeout = min(timeout, float(max_age))
-
-    status_rule = descriptor.get("status") or {}
-
-    def status_of(doc):
-        return str(_json_path(doc, str(status_rule.get("path") or "")))
-
-    # The submission may already be the finished answer: no poll needed.
-    if descriptor.get("terminal_on_submission") is True and _classify(descriptor, submitted) == "success":
-        return {"response": submission, "status": status_of(submitted), "task_id": task_id}
-
-    start = time.monotonic()
-    while True:
-        if time.monotonic() - start >= timeout:
-            return {"error": f"timed out after {int(timeout)}s waiting for task {task_id}",
-                    "task_id": task_id, "response": None}
-        time.sleep(interval)
-        try:
-            r = client.call(target, "GET", params=params)
-        except httpx.HTTPError as e:
-            on_progress(f"poll error: {e} — retrying")
-            continue
-        if r.status_code >= 400:
-            return {"error": f"polling returned HTTP {r.status_code}",
-                    "task_id": task_id, "response": r}
-        try:
-            doc = r.json()
-        except ValueError:
-            return {"error": "a polling response was not JSON", "task_id": task_id, "response": r}
-
-        outcome = _classify(descriptor, doc)
-        status = status_of(doc)
-        if outcome == "success":
-            out: dict = {"response": r, "status": status, "task_id": task_id}
-            rule = descriptor.get("result") or {}
-            if rule.get("path"):
-                value = _json_path(doc, str(rule["path"]))
-                out["result"] = value
-                cands = value if isinstance(value, list) else [value]
-                out["result_url"] = next(
-                    (c for c in cands if isinstance(c, str) and c.startswith(("http://", "https://"))),
-                    None)
-            else:
-                fr = rule.get("fetch_param") or {}
-                fv = _json_path(doc, str(fr.get("value_from") or ""))
-                if rule.get("fetch") and fr.get("name") and fv not in (None, ""):
-                    out["fetch"] = {"endpoint": str(rule["fetch"]),
-                                    "name": str(fr["name"]), "value": str(fv)}
-            if rule.get("ttl_note"):
-                out["ttl_note"] = str(rule["ttl_note"])
-            return out
-        if outcome in ("failure", "billed_failure"):
-            return {"error": f"task {task_id} finished with status {status!r} ({outcome})",
-                    "task_id": task_id, "response": r, "status": status}
-        on_progress(f"task {task_id}: {status} ({int(time.monotonic() - start)}s elapsed)")
 
 
 # ---------------------------------------------------------------------------
@@ -934,7 +533,12 @@ class Worker(threading.Thread):
 # ---------------------------------------------------------------------------
 
 class MainWindow(Gtk.ApplicationWindow):
-    ASK_HINT = "Ask a question about the summary — the answer appears here."
+    AI_HINT = ("**AI interaction** — ask anything. I can use every data source "
+               "in the app as a tool: the treg catalog and any endpoint, web "
+               "search and pages, X, Reddit, News and Markets.\n\n"
+               "Try: *“what's moving in the market today and why?”*, "
+               "*“summarize the top tech news”*, *“find an endpoint for "
+               "backlinks and call it for example.com”*.")
 
     def __init__(self, application):
         super().__init__(application=application)
@@ -960,6 +564,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self._news_selected: dict | None = None
         self._news_label = "News"
         self._md_links: dict[Gtk.TextView, list[tuple[int, int, str]]] = {}
+        self._ai_messages: list[dict] = []
+        self._ai_busy = False
 
         self._build_ui()
         self.connect("destroy", self._on_destroy)
@@ -1003,7 +609,7 @@ class MainWindow(Gtk.ApplicationWindow):
 
         self.tabs = Gtk.Notebook()
         self.tabs.append_page(self._build_browse_tab(), Gtk.Label(label="Browse"))
-        self.tabs.append_page(self._build_summarize_tab(), Gtk.Label(label="Summarize"))
+        self.tabs.append_page(self._build_ai_tab(), Gtk.Label(label="AI"))
         self.tabs.append_page(self._build_catalog_tab(), Gtk.Label(label="Catalog"))
         self.tabs.append_page(self._build_providers_tab(), Gtk.Label(label="Providers"))
         self.tabs.append_page(self._build_call_tab(), Gtk.Label(label="Call"))
@@ -1054,9 +660,10 @@ class MainWindow(Gtk.ApplicationWindow):
         self.browse_query.connect("activate", lambda e: self._do_browse_search())
         go = Gtk.Button(label="Search")
         go.connect("clicked", lambda b: self._do_browse_search())
-        self.browse_summarize_btn = Gtk.Button(label="Summarize")
+        self.browse_summarize_btn = Gtk.Button(label="Ask AI")
         self.browse_summarize_btn.set_tooltip_text(
-            f"Summarize the current results with {SUMMARY_MODEL} via {SUMMARY_URL}")
+            f"Hand the current results to the AI ({AI_MODEL}) — it can read "
+            "pages and call tools")
         self.browse_summarize_btn.set_sensitive(False)
         self.browse_summarize_btn.connect("clicked", lambda b: self._do_browse_summarize())
         self.browse_limit = Gtk.SpinButton.new_with_range(3, 20, 1)
@@ -1097,45 +704,53 @@ class MainWindow(Gtk.ApplicationWindow):
         w.pack_start(paned, True, True, 0)
         return w
 
-    def _build_summarize_tab(self) -> Gtk.Widget:
-        """The summary of the current Browse-tab search, plus an 'Ask
-        further' box for follow-up questions about it."""
+    def _build_ai_tab(self) -> Gtk.Widget:
+        """AI interaction: a chat with the local model, which can call every
+        data source in the app as a tool (treg catalog/endpoints, web, X,
+        Reddit, News, Markets) and answers in Markdown. Tools show up inline
+        as they run."""
         w = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
 
-        # A draggable divider between the summary and the 'Ask further'
-        # pane, so either side can be resized.
-        paned = Gtk.Paned.new(Gtk.Orientation.VERTICAL)
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        title = Gtk.Label()
+        title.set_markup(f"<b>AI interaction</b> — {_esc(AI_MODEL)}")
+        title.set_xalign(0.0)
+        tools = Gtk.Label()
+        tools.set_markup(f"<i>{_esc(tool_summary())} · {_esc(AI_URL)}</i>")
+        tools.set_xalign(0.0)
+        tools.set_ellipsize(Pango.EllipsizeMode.END)
+        self.ai_new_btn = Gtk.Button(label="New chat")
+        self.ai_new_btn.set_tooltip_text("Start a fresh conversation")
+        self.ai_new_btn.connect("clicked", lambda b: self._ai_new_chat())
+        head.pack_start(title, False, False, 0)
+        head.pack_start(tools, True, True, 0)
+        head.pack_end(self.ai_new_btn, False, False, 0)
+        w.pack_start(head, False, False, 0)
 
-        out_box = Gtk.Frame(label=f"Summary — {SUMMARY_MODEL}")
-        self.summarize_view = self._textview()
-        self.summarize_view.connect("button-press-event", self._md_link_click)
-        out_box.add(self._scrolled(self.summarize_view))
-        paned.pack1(out_box, True, True)
+        chat = Gtk.Frame()
+        self.ai_view = self._textview()
+        self.ai_view.connect("button-press-event", self._md_link_click)
+        self.ai_scroll = self._scrolled(self.ai_view)
+        chat.add(self.ai_scroll)
+        w.pack_start(chat, True, True, 0)
 
-        chat_box = Gtk.Frame(label="Ask further")
-        cv = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        chat_box.add(cv)
-        self.ask_view = self._textview()
-        self.ask_view.connect("button-press-event", self._md_link_click)
-        self.ask_scroll = self._scrolled(self.ask_view)
-        cv.pack_start(self.ask_scroll, True, True, 0)
-        # placeholder until the first question is asked
-        abuf = self.ask_view.get_buffer()
-        abuf.set_text(self.ASK_HINT)
-        atag = abuf.create_tag("chat-hint", style=Pango.Style.ITALIC)
-        abuf.apply_tag(atag, abuf.get_start_iter(), abuf.get_end_iter())
-        ask_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        self.ask_entry = Gtk.Entry()
-        self.ask_entry.set_placeholder_text("Ask a follow-up question about the summary…")
-        self.ask_entry.connect("activate", lambda e: self._do_ask())
-        self.ask_btn = Gtk.Button(label="Ask")
-        self.ask_btn.connect("clicked", lambda b: self._do_ask())
-        ask_row.pack_start(self.ask_entry, True, True, 0)
-        ask_row.pack_start(self.ask_btn, False, False, 0)
-        cv.pack_start(ask_row, False, False, 0)
-        paned.pack2(chat_box, True, True)
-        paned.set_position(500)
-        w.pack_start(paned, True, True, 0)
+        self.ai_status = Gtk.Label(label="ready")
+        self.ai_status.set_xalign(0.0)
+        self.ai_status.set_ellipsize(Pango.EllipsizeMode.END)
+        w.pack_start(self.ai_status, False, False, 0)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.ai_entry = Gtk.Entry()
+        self.ai_entry.set_placeholder_text(
+            "Ask anything — search, read, call tools, check news and markets…")
+        self.ai_entry.connect("activate", lambda e: self._ai_send())
+        self.ai_send_btn = Gtk.Button(label="Send")
+        self.ai_send_btn.connect("clicked", lambda b: self._ai_send())
+        row.pack_start(self.ai_entry, True, True, 0)
+        row.pack_start(self.ai_send_btn, False, False, 0)
+        w.pack_start(row, False, False, 0)
+
+        self._render_md(self.ai_view, self.AI_HINT)
         return w
 
     def _build_catalog_tab(self) -> Gtk.Widget:
@@ -1374,9 +989,15 @@ class MainWindow(Gtk.ApplicationWindow):
         self.x_open_btn = Gtk.Button(label="Open on X")
         self.x_open_btn.set_sensitive(False)
         self.x_open_btn.connect("clicked", lambda b: self._x_open())
+        self.x_ask_btn = Gtk.Button(label="Ask AI")
+        self.x_ask_btn.set_tooltip_text(
+            "Ask the AI about this post — it can load the thread and profile")
+        self.x_ask_btn.set_sensitive(False)
+        self.x_ask_btn.connect("clicked", lambda b: self._x_ask_ai())
         btn_row.pack_start(self.x_replies_btn, False, False, 0)
         btn_row.pack_start(self.x_profile_btn, False, False, 0)
         btn_row.pack_start(self.x_open_btn, False, False, 0)
+        btn_row.pack_start(self.x_ask_btn, False, False, 0)
         w.pack_start(btn_row, False, False, 0)
         return w
 
@@ -1430,9 +1051,15 @@ class MainWindow(Gtk.ApplicationWindow):
         self.r_open_btn = Gtk.Button(label="Open on Reddit")
         self.r_open_btn.set_sensitive(False)
         self.r_open_btn.connect("clicked", lambda b: self._r_open())
+        self.r_ask_btn = Gtk.Button(label="Ask AI")
+        self.r_ask_btn.set_tooltip_text(
+            "Ask the AI about this post — it can read the comments and profile")
+        self.r_ask_btn.set_sensitive(False)
+        self.r_ask_btn.connect("clicked", lambda b: self._r_ask_ai())
         btn_row.pack_start(self.r_comments_btn, False, False, 0)
         btn_row.pack_start(self.r_profile_btn, False, False, 0)
         btn_row.pack_start(self.r_open_btn, False, False, 0)
+        btn_row.pack_start(self.r_ask_btn, False, False, 0)
         w.pack_start(btn_row, False, False, 0)
         return w
 
@@ -1491,8 +1118,15 @@ class MainWindow(Gtk.ApplicationWindow):
         self.m_fundamentals_btn = Gtk.Button(label="Fundamentals")
         self.m_fundamentals_btn.set_tooltip_text("profile and metrics for the current ticker")
         self.m_fundamentals_btn.connect("clicked", lambda b: self._m_jump("fundamentals"))
+        self.m_ask_btn = Gtk.Button(label="Ask AI")
+        self.m_ask_btn.set_tooltip_text(
+            "Ask the AI about what is on screen — it can pull news, more "
+            "history and crypto")
+        self.m_ask_btn.set_sensitive(False)
+        self.m_ask_btn.connect("clicked", lambda b: self._m_ask_ai())
         btn_row.pack_start(self.m_history_btn, False, False, 0)
         btn_row.pack_start(self.m_fundamentals_btn, False, False, 0)
+        btn_row.pack_start(self.m_ask_btn, False, False, 0)
         w.pack_start(btn_row, False, False, 0)
         return w
 
@@ -1500,8 +1134,8 @@ class MainWindow(Gtk.ApplicationWindow):
         """A news front page: Top/Tech/Business aggregate free RSS feeds
         (deduped and ranked, no treg calls); Search uses treg's routed news
         search. A story opens in the pane on the right, where it can be read
-        in full (treg web extract) or the current list can be digested by the
-        local model."""
+        in full (treg web extract), handed to the AI, or the whole list
+        digested by the AI."""
         w = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
 
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -1561,14 +1195,21 @@ class MainWindow(Gtk.ApplicationWindow):
         self.news_open_btn = Gtk.Button(label="Open in browser")
         self.news_open_btn.set_sensitive(False)
         self.news_open_btn.connect("clicked", lambda b: self._news_open())
-        self.news_digest_btn = Gtk.Button(label="Digest")
+        self.news_digest_btn = Gtk.Button(label="AI digest")
         self.news_digest_btn.set_tooltip_text(
-            f"Summarize the current stories with {SUMMARY_MODEL}")
+            f"Summarize the current stories in the AI tab ({AI_MODEL})")
         self.news_digest_btn.set_sensitive(False)
         self.news_digest_btn.connect("clicked", lambda b: self._news_digest())
+        self.news_ask_btn = Gtk.Button(label="Ask AI")
+        self.news_ask_btn.set_tooltip_text(
+            "Ask the AI about the selected story — it can read the article "
+            "and search for more context")
+        self.news_ask_btn.set_sensitive(False)
+        self.news_ask_btn.connect("clicked", lambda b: self._news_ask_ai())
         btn_row.pack_start(self.news_read_btn, False, False, 0)
         btn_row.pack_start(self.news_open_btn, False, False, 0)
         btn_row.pack_start(self.news_digest_btn, False, False, 0)
+        btn_row.pack_start(self.news_ask_btn, False, False, 0)
         w.pack_start(btn_row, False, False, 0)
         self._render_md(
             self.news_detail,
@@ -1656,6 +1297,12 @@ class MainWindow(Gtk.ApplicationWindow):
         buf = view.get_buffer()
         start, end = buf.get_bounds()
         return buf.get_text(start, end, True)
+
+    @staticmethod
+    def _scroll_bottom(sw: Gtk.ScrolledWindow) -> None:
+        adj = sw.get_vadjustment()
+        if adj is not None:
+            adj.set_value(adj.get_upper())
 
     def _spawn(self, fn, *args, on_ok=None, on_fail=None, **kwargs) -> Worker:
         w = Worker(fn, *args, on_ok=on_ok, on_fail=on_fail, **kwargs)
@@ -1932,89 +1579,124 @@ class MainWindow(Gtk.ApplicationWindow):
         self.browse_meta.set_text(" · ".join(bits))
         self._busy(" · ".join(bits))
 
+    # -- AI interaction ---------------------------------------------------------
+
+    def _ai_new_chat(self):
+        self._ai_messages = []
+        self._ai_busy = False
+        self.ai_send_btn.set_sensitive(True)
+        self.ai_entry.set_sensitive(True)
+        self.ai_status.set_text("ready")
+        self._render_md(self.ai_view, self.AI_HINT)
+        self._busy("New AI chat")
+        self.ai_entry.grab_focus()
+
+    def _ai_ask(self, prompt: str, context: str | None = None,
+                display: str | None = None):
+        """Send a turn to the AI tab (optionally with hidden context)."""
+        self.tabs.set_current_page(1)
+        self.ai_entry.set_text("")
+        content = prompt if not context else f"{prompt}\n\n{context}"
+        self._ai_submit(content, display or prompt)
+
+    def _ai_send(self):
+        text = self.ai_entry.get_text().strip()
+        if not text:
+            return
+        self.ai_entry.set_text("")
+        self._ai_submit(text)
+
+    def _ai_submit(self, content: str, display: str | None = None):
+        if self._ai_busy:
+            self._error("the AI is still answering — wait for it to finish")
+            return
+        if not self._ai_messages and self._text(self.ai_view) == self.AI_HINT:
+            self.ai_view.get_buffer().set_text("")
+        self._append_ai_turn("You", display or content)
+        self._ai_messages.append({"role": "user", "content": content})
+        self._ai_busy = True
+        self.ai_send_btn.set_sensitive(False)
+        self.ai_entry.set_sensitive(False)
+        self.ai_status.set_text("thinking…")
+        self._busy(f"AI: thinking with {AI_MODEL}…")
+        history = [dict(m) for m in self._ai_messages]
+        self._spawn(run_agent, self.client, history, self._ai_progress,
+                    on_ok=self._ai_done, on_fail=self._ai_failed)
+
+    def _append_ai_turn(self, who: str, text: str):
+        buf = self.ai_view.get_buffer()
+        if buf.get_char_count():
+            buf.insert(buf.get_end_iter(), "\n\n")
+        self._insert_md(self.ai_view, buf.get_end_iter(), f"**{who} —** {text}\n")
+        self._scroll_bottom(self.ai_scroll)
+
+    def _append_ai_tool(self, line: str):
+        buf = self.ai_view.get_buffer()
+        end = buf.get_end_iter()
+        if buf.get_char_count() and not self._text_ends_with_newline():
+            buf.insert(end, "\n")
+            end = buf.get_end_iter()
+        buf.insert_markup(end, f"<i>{_esc(line)}</i>\n", -1)
+        self._scroll_bottom(self.ai_scroll)
+
+    def _text_ends_with_newline(self) -> bool:
+        buf = self.ai_view.get_buffer()
+        return buf.get_char_count() > 0 and buf.get_text(
+            buf.get_iter_at_offset(buf.get_char_count() - 1),
+            buf.get_end_iter(), True) == "\n"
+
+    def _ai_progress(self, kind: str, data):
+        """Worker-thread progress → main loop."""
+        GLib.idle_add(self._ai_event, kind, data)
+
+    def _ai_event(self, kind: str, data) -> bool:
+        if kind == "status":
+            self.ai_status.set_text(str(data))
+            self._busy(f"AI: {data}")
+        elif kind == "tool":
+            name = str(data.get("name") or "tool")
+            args = data.get("arguments") or {}
+            shown = ", ".join(f"{k}={json.dumps(v, ensure_ascii=False)[:60]}"
+                              for k, v in args.items())
+            self._append_ai_tool(f"→ {name}({shown})")
+            self.ai_status.set_text(f"running {name}…")
+        elif kind == "tool_result":
+            preview = str(data.get("result") or "").replace("\n", " ")[:140]
+            self._append_ai_tool(f"← {preview}")
+        return False
+
+    def _ai_done(self, out: dict):
+        self._ai_busy = False
+        self.ai_send_btn.set_sensitive(True)
+        self.ai_entry.set_sensitive(True)
+        self.ai_status.set_text("ready")
+        self._ai_messages = out.get("messages") or self._ai_messages
+        self._append_ai_turn("AI", out.get("text") or
+                             "(the model returned an empty answer)")
+        self._busy(f"AI answered ({AI_MODEL})")
+        self.ai_entry.grab_focus()
+
+    def _ai_failed(self, msg: str):
+        self._ai_busy = False
+        self.ai_send_btn.set_sensitive(True)
+        self.ai_entry.set_sensitive(True)
+        self.ai_status.set_text("failed")
+        self._append_ai_tool(f"← (failed) {msg}")
+        self._error(f"AI: {msg}")
+
     def _do_browse_summarize(self):
         rows = getattr(self, "_browse_rows", None)
         if not rows:
-            self._error("run a search first, then press Summarize")
+            self._error("run a search first, then press Ask AI")
             return
-        self.browse_summarize_btn.set_sensitive(False)
-        self.tabs.set_current_page(1)  # the Summarize tab
-        self._render_md(self.summarize_view, f"*Summarizing with {SUMMARY_MODEL} …*")
-        self._busy(f"Summarizing “{self._browse_last_query}” with {SUMMARY_MODEL} …")
-        self._spawn(summarize, self._browse_last_query, rows,
-                    on_ok=self._browse_summary_done,
-                    on_fail=lambda m: self._browse_summary_failed(m))
-
-    def _browse_summary_done(self, text: str):
-        self.browse_summarize_btn.set_sensitive(True)
-        self.tabs.set_current_page(1)
-        self._render_md(self.summarize_view,
-                        text or "(the model returned an empty summary)")
-        self._busy(f"Summary ready ({SUMMARY_MODEL})")
-
-    def _browse_summary_failed(self, msg: str):
-        self.browse_summarize_btn.set_sensitive(True)
-        self.tabs.set_current_page(1)
-        self._render_md(self.summarize_view, f"*(summarize failed) {msg}*")
-        self._error(f"summarize: {msg}")
-
-    def _do_ask(self):
-        rows = getattr(self, "_browse_rows", None)
-        question = self.ask_entry.get_text().strip()
-        summary = self._text(self.summarize_view)
-        if not question:
-            return
-        if not rows or not summary or summary.startswith("Summarizing"):
-            self._error("run a search and press Summarize first, then ask a follow-up")
-            return
-        self.ask_entry.set_text("")
-        self.ask_btn.set_sensitive(False)
-        buf = self.ask_view.get_buffer()
-        if buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True) == self.ASK_HINT:
-            buf.set_text("")
-        self._append_chat_q(question)
-        self._busy("Answering follow-up…")
-        self._spawn(ask_followup, self._browse_last_query, rows, summary, question,
-                    on_ok=self._ask_done,
-                    on_fail=lambda m: self._ask_failed(m))
-
-    def _chat_q_tag(self, buffer: Gtk.TextBuffer) -> Gtk.TextTag:
-        table = buffer.get_tag_table()
-        tag = table.lookup("chat-q")
-        if tag is None:
-            tag = buffer.create_tag("chat-q")
-            tag.set_property("weight", Pango.Weight.BOLD)
-        return tag
-
-    def _append_chat_q(self, question: str) -> None:
-        """Append a styled question line (bold 'You — …')."""
-        buf = self.ask_view.get_buffer()
-        text = f"You — {question}\n"
-        it = buf.get_end_iter()
-        off = it.get_offset()
-        buf.insert(it, text)
-        buf.apply_tag(self._chat_q_tag(buf),
-                      buf.get_iter_at_offset(off), buf.get_iter_at_offset(off + len(text)))
-
-    @staticmethod
-    def _scroll_bottom(sw: Gtk.ScrolledWindow) -> None:
-        adj = sw.get_vadjustment()
-        if adj is not None:
-            adj.set_value(adj.get_upper())
-
-    def _ask_done(self, text: str):
-        self.ask_btn.set_sensitive(True)
-        self._insert_md(self.ask_view, self.ask_view.get_buffer().get_end_iter(),
-                        text or "(the model returned an empty answer)")
-        self._scroll_bottom(self.ask_scroll)
-        self._busy("Follow-up answered")
-
-    def _ask_failed(self, msg: str):
-        self.ask_btn.set_sensitive(True)
-        self._insert_md(self.ask_view, self.ask_view.get_buffer().get_end_iter(),
-                        f"*(failed) {msg}*\n")
-        self._scroll_bottom(self.ask_scroll)
-        self._error(f"ask: {msg}")
+        q = self._browse_last_query
+        self._ai_ask(
+            f"Summarize what these web search results say about “{q}” in "
+            "3–5 sentences of Markdown. Cover the points they agree and "
+            "disagree on; do not just list URLs. Use read_page if an "
+            "important result needs more detail.",
+            _results_block(q, rows))
+        self._busy(f"AI is reading the results for “{q}”…")
 
     def _on_browse_result_selected(self):
         model, treeiter = self.browse_results.get_selection().get_selected()
@@ -2344,6 +2026,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.x_replies_btn.set_sensitive(bool(p["id"]))
         self.x_profile_btn.set_sensitive(bool(p["author_handle"]))
         self.x_open_btn.set_sensitive(bool(p["url"]))
+        self.x_ask_btn.set_sensitive(True)
         self._x_show_image(p)
 
     def _x_show_image(self, p: dict):
@@ -2450,6 +2133,27 @@ class MainWindow(Gtk.ApplicationWindow):
                 Gio.AppInfo.launch_default_for_uri(p["url"], None)
             except GLib.Error as e:
                 self._error(f"could not open {p['url']}: {e.message}")
+
+    def _x_ask_ai(self):
+        p = self._x_selected
+        if not p:
+            self._error("select a post first")
+            return
+        context = (
+            "X post:\n"
+            f"Author: {p.get('author_name', '')} (@{p.get('author_handle', '')})\n"
+            f"Posted: {_x_when(p.get('created'))}\n"
+            f"Text: {p.get('text', '')}\n"
+            f"Stats: {_count(p.get('likes'))} likes, "
+            f"{_count(p.get('retweets'))} reposts, "
+            f"{_count(p.get('replies'))} replies\n"
+            f"URL: {p.get('url', '')}"
+        )
+        self._ai_ask(
+            "Explain this X post: the claim, the context, who the author is, "
+            "and how it is being received. Load the replies or profile if "
+            "that helps.",
+            context, display=f"Explain this post: {p.get('text', '')[:80]}")
 
     # -- Reddit tab ---------------------------------------------------------------
 
@@ -2590,6 +2294,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.r_comments_btn.set_sensitive(bool(p["id"]))
         self.r_profile_btn.set_sensitive(bool(p["author"]))
         self.r_open_btn.set_sensitive(bool(p["url"]))
+        self.r_ask_btn.set_sensitive(True)
         self._r_show_image(p)
 
     def _r_show_image(self, p: dict):
@@ -2712,6 +2417,26 @@ class MainWindow(Gtk.ApplicationWindow):
             except GLib.Error as e:
                 self._error(f"could not open {p['url']}: {e.message}")
 
+    def _r_ask_ai(self):
+        p = self._r_selected
+        if not p:
+            self._error("select a post first")
+            return
+        context = (
+            "Reddit post:\n"
+            f"Title: {p.get('title', '')}\n"
+            f"Subreddit: {p.get('subreddit', '')}\n"
+            f"Author: u/{p.get('author', '')}\n"
+            f"Posted: {_reddit_when(p.get('created'))}\n"
+            f"Score: {_count(p.get('score'))} · comments: {_count(p.get('comments'))}\n"
+            f"Body: {p.get('body', '')}\n"
+            f"URL: {p.get('url', '')}"
+        )
+        self._ai_ask(
+            "Explain this Reddit post: what is being discussed, the community "
+            "reaction, and any useful details. Load the comments if it helps.",
+            context, display=f"Explain this post: {p.get('title', '')[:80]}")
+
     # -- Markets tab ---------------------------------------------------------------
 
     def _m_mode(self) -> str:
@@ -2788,6 +2513,7 @@ class MainWindow(Gtk.ApplicationWindow):
                         on_fail=lambda m: self._error(f"coin: {m}"))
 
     def _m_status(self, n: int, noun: str):
+        self.m_ask_btn.set_sensitive(True)
         self._busy(f"{n} {noun} · via yfinance (direct, free)")
 
     def _m_fill_quote(self, q: dict):
@@ -2974,6 +2700,32 @@ class MainWindow(Gtk.ApplicationWindow):
                     on_ok=self._m_coin_done,
                     on_fail=lambda m: self._error(f"coin: {m}"))
 
+    def _m_ask_ai(self):
+        mode = self._m_mode()
+        sym = self.m_entry.get_text().strip().upper()
+        rows = []
+        for row in self.m_store:
+            cells = [str(c) for c in row if str(c)]
+            if cells:
+                rows.append(" | ".join(cells))
+        context = (
+            f"Markets tab — {mode} view"
+            + (f" for {sym}" if sym else "")
+            + ":\n"
+            + "\n".join(rows[:40])
+            + "\n\n"
+            + self._text(self.m_detail)
+        )
+        if not rows:
+            self._error("load a quote, history or fundamentals first")
+            return
+        self._ai_ask(
+            "Analyze what is on screen: the key numbers, the trend, and what "
+            "they mean. Pull fundamentals, more history, news or crypto if it "
+            "adds context.",
+            context, display=f"Analyze the {mode} view"
+            + (f" for {sym}" if sym else ""))
+
     # -- News tab --------------------------------------------------------------
 
     def _news_mode(self) -> str:
@@ -3001,6 +2753,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.news_read_btn.set_sensitive(False)
         self.news_open_btn.set_sensitive(False)
         self.news_digest_btn.set_sensitive(False)
+        self.news_ask_btn.set_sensitive(False)
         hint = (f"*{self._news_label} — press **Go** to load the stories.*"
                 if mode != "search" else
                 "*Type a query and press **Go** to search the news through treg.*")
@@ -3048,6 +2801,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.news_read_btn.set_sensitive(False)
         self.news_open_btn.set_sensitive(False)
         self.news_digest_btn.set_sensitive(bool(self._news_items))
+        self.news_ask_btn.set_sensitive(False)
         if not self._news_items:
             self._render_md(self.news_detail,
                             f"*{label} returned no stories — try again.*")
@@ -3057,8 +2811,8 @@ class MainWindow(Gtk.ApplicationWindow):
             self.news_detail,
             f"**{label}** — {len(self._news_items)} stories\n\n"
             "*Select a story to see it here, **Read article** to fetch the "
-            "full text, or **Digest** to summarize the list with "
-            f"{SUMMARY_MODEL}.*")
+            "full text, **Ask AI** about it, or **AI digest** to summarize "
+            "the whole list.*")
         bits = [f"{len(self._news_items)} stories"]
         if out.get("feeds"):
             bits.append(f"from {out['feeds']} feeds")
@@ -3101,6 +2855,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.news_read_btn.set_sensitive(
             bool(p.get("url") and self.client is not None))
         self.news_open_btn.set_sensitive(bool(p.get("url")))
+        self.news_ask_btn.set_sensitive(True)
         self._news_show_image(p)
 
     def _news_show_image(self, p: dict):
@@ -3192,25 +2947,36 @@ class MainWindow(Gtk.ApplicationWindow):
     def _news_digest(self):
         rows = self._news_items
         if not rows:
-            self._error("load some stories first, then press Digest")
+            self._error("load some stories first, then press AI digest")
             return
-        self.news_digest_btn.set_sensitive(False)
-        self._render_md(self.news_detail,
-                        f"*Digesting {min(len(rows), 12)} stories with "
-                        f"{SUMMARY_MODEL} …*")
-        self._busy(f"Writing a digest with {SUMMARY_MODEL} …")
-        self._spawn(_complete, digest_prompt(self._news_label, rows),
-                    on_ok=self._news_digest_done,
-                    on_fail=self._news_digest_failed)
+        n = min(len(rows), 12)
+        self._ai_ask(
+            f"Write a digest of the {n} current {self._news_label} stories "
+            "below. You can call the news tools for anything more recent.",
+            digest_prompt(self._news_label, rows),
+            display=f"Write a digest of the current {self._news_label} stories.")
+        self._busy(f"AI is digesting {n} stories…")
 
-    def _news_digest_done(self, text: str):
-        self.news_digest_btn.set_sensitive(bool(self._news_items))
-        body = text or "(the model returned an empty digest)"
-        self._render_md(self.news_detail,
-                        f"# News digest\n\n{body}\n\n"
-                        f"*{min(len(self._news_items), 12)} stories · "
-                        f"{SUMMARY_MODEL}*")
-        self._busy(f"Digest ready ({SUMMARY_MODEL})")
+    def _news_ask_ai(self):
+        p = self._news_selected
+        if not p:
+            self._error("select a story first")
+            return
+        sources = ", ".join(p.get("sources") or [])
+        context = (
+            "Story:\n"
+            f"Title: {p.get('title', '')}\n"
+            f"Sources: {sources or p.get('source_label') or p.get('source') or 'unknown'}\n"
+            f"Published: {p.get('published') or ''}\n"
+            f"URL: {p.get('url') or ''}\n"
+            f"Snippet: {p.get('snippet') or ''}"
+        )
+        self._ai_ask(
+            "Explain this news story: what happened, who is involved, the "
+            "numbers that matter, and the likely impact. Read the full "
+            "article and look for related coverage if it helps.",
+            context,
+            display=f"Explain this story: {p.get('title', '')}")
 
     def _news_digest_failed(self, msg: str):
         self.news_digest_btn.set_sensitive(bool(self._news_items))
