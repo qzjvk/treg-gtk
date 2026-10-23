@@ -21,6 +21,9 @@ Tabs:
              and trending topics
   Reddit   — a Reddit frontend: search posts, browse a subreddit's or a
              user's posts, read a post with its media, and its comment tree
+  Markets  — market data: live stock quotes, daily price history, company
+             fundamentals, and crypto. Backed by yfinance (free, direct —
+             no treg calls, no charges), with price and margin charts
 
 Credentials come from the treg CLI config (~/.treg/config.json) or TREG_TOKEN.
 """
@@ -43,10 +46,13 @@ gi.require_version("Gdk", "3.0")
 gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import Gio, GLib, Gdk, GdkPixbuf, Gtk, Pango
 
+import cairo
 import httpx
 
 from .client import TregClient, TregError, load_credentials
 from .desktop import install_desktop_entry, remove_desktop_entry
+from .markets import (MAJOR_COINS, yf_coins, yf_crypto_quote, yf_fundamentals,
+                      yf_history, yf_quote)
 
 MICRO = 1_000_000
 
@@ -269,6 +275,104 @@ def _reddit_call(client: TregClient, target: str, method: str,
         time.sleep(2.0)
         r = client.call(target, method, params, body)
     return r
+
+
+# ---------------------------------------------------------------------------
+# Markets tab helpers — yfinance is the backend (markets.py); the tab makes
+# no treg calls, so it works without a treg token and never charges
+# ---------------------------------------------------------------------------
+
+_M_MARKET_MODES = ("stock", "history", "fundamentals", "crypto")
+
+
+def _m_price(v) -> str:
+    if v is None:
+        return "—"
+    sign = "-" if v < 0 else ""
+    a = abs(v)
+    if a >= 1000:
+        return f"{sign}${a:,.0f}"
+    if a >= 1:
+        return f"{sign}${a:,.2f}"
+    return f"{sign}${a:,.4f}"
+
+
+def _m_big(v) -> str:
+    """$4.46t / $340b / $12.3m for big amounts (caps, volumes, revenue)."""
+    if v is None:
+        return "—"
+    a = abs(v)
+    if a >= 1e12:
+        return f"${v / 1e12:,.1f}t"
+    if a >= 1e9:
+        return f"${v / 1e9:,.1f}b"
+    if a >= 1e6:
+        return f"${v / 1e6:,.1f}m"
+    return f"${v:,.0f}"
+
+
+def _m_pct(v) -> str:
+    if v is None:
+        return "—"
+    return f"{v:+.1f}%"
+
+
+def _m_frac(v) -> str:
+    """A fraction (0.45) as a percent (45.0%) — margins, yields, growth."""
+    if v is None:
+        return "—"
+    return f"{v * 100:.1f}%"
+
+
+def _m_ratio(v) -> str:
+    """A plain ratio (P/E, beta, debt/equity) with two decimals."""
+    if v is None:
+        return "—"
+    return f"{v:.2f}"
+
+
+def _m_quote_worker(symbol: str) -> dict:
+    """Live quote + the last 30 daily bars (for the chart)."""
+    q = yf_quote(symbol)
+    if q is None:
+        raise TregError(f"no quote for {symbol} — check the ticker")
+    return {"quote": q, "bars": yf_history(symbol, 30)}
+
+
+def _m_history_worker(symbol: str, days: int) -> list[dict]:
+    bars = yf_history(symbol, days)
+    if not bars:
+        raise TregError(f"no daily bars for {symbol} — check the ticker")
+    return bars
+
+
+def _m_fundamentals_worker(symbol: str) -> dict | None:
+    return yf_fundamentals(symbol)
+
+
+def _m_coins_worker() -> list[dict]:
+    rows = yf_coins()
+    if not rows:
+        raise TregError("no coin data — Yahoo returned nothing")
+    return rows
+
+
+def _m_coin_worker(query: str) -> dict:
+    """One coin by ticker (BTC, ETH, …) or by name (bitcoin), plus its last
+    90 daily bars for the chart."""
+    sym = query.upper().strip()
+    if sym.endswith("-USD"):
+        sym = sym[:-4]
+    q = yf_crypto_quote(sym)
+    if q is None:  # the query might be a coin name — match the majors
+        for s, name in MAJOR_COINS:
+            if query.lower() in (s.lower(), name.lower()):
+                q = yf_crypto_quote(s)
+                sym = s
+                break
+    if q is None:
+        raise TregError(f"no data for coin {query} — try a ticker like BTC or ETH")
+    return {"quote": q, "name": sym, "bars": yf_history(f"{sym}-USD", 90)}
 
 
 def pretty_json(obj: object) -> str:
@@ -613,6 +717,180 @@ def poll_async_task(client: TregClient, descriptor: dict, submission: httpx.Resp
 # worker thread
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Charts — plain Cairo DrawingAreas in the widget's theme colors, so the
+# app stays dependency-free (no matplotlib / goo-canvas) and native-looking
+# ---------------------------------------------------------------------------
+
+def _chart_fg(cr, area: Gtk.DrawingArea):
+    """The theme's foreground color as (r, g, b) for cairo drawing."""
+    c = area.get_style_context().get_color(Gtk.StateFlags.NORMAL)
+    return (c.red, c.green, c.blue)
+
+
+def _chart_frame(cr, w: int, h: int, rgb):
+    """A thin rounded border in a faded fg color (the chart's frame)."""
+    cr.set_source_rgba(*rgb, 0.3)
+    cr.set_line_width(0.5)
+    cr.rectangle(0.5, 0.5, w - 1, h - 1)
+    cr.stroke()
+
+
+def _chart_text(cr, x: float, y: float, text: str, size: float,
+                rgb, alpha: float = 1.0, bold: bool = False):
+    cr.set_source_rgba(*rgb, alpha)
+    cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL,
+                        cairo.FONT_WEIGHT_BOLD if bold else cairo.FONT_WEIGHT_NORMAL)
+    cr.set_font_size(size)
+    cr.move_to(x, y)
+    cr.show_text(text)
+
+
+class PriceChart(Gtk.DrawingArea):
+    """A closing-price line chart with a light area fill, grid lines and
+    axis labels. set_data(dates, values) then queue_draw; values may have
+    None gaps."""
+
+    def __init__(self, height: int = 200):
+        super().__init__()
+        self.set_size_request(-1, height)
+        self._dates: list[str] = []
+        self._values: list[float | None] = []
+        self.connect("draw", self._on_draw)
+
+    def set_data(self, dates: list[str], values: list[float | None]):
+        self._dates = list(dates)
+        self._values = list(values)
+        self.queue_draw()
+
+    @staticmethod
+    def _date_label(s: str) -> str:
+        try:
+            return time.strftime("%b %d", time.strptime(s[:10], "%Y-%m-%d"))
+        except ValueError:
+            return s[:10]
+
+    def _on_draw(self, _widget, cr):
+        w, h = self.get_allocated_width(), self.get_allocated_height()
+        rgb = _chart_fg(cr, self)
+        _chart_frame(cr, w, h, rgb)
+        pts = [(d, v) for d, v in zip(self._dates, self._values) if v is not None]
+        if len(pts) < 2:
+            _chart_text(cr, 12, h / 2, "not enough data for a chart", 10, rgb, 0.6)
+            return
+        left, right, top, bottom = 52, 10, 10, 20
+        x0, x1 = left, w - right
+        y0, y1 = top, h - bottom
+        vals = [v for _, v in pts]
+        vmin, vmax = min(vals), max(vals)
+        if vmax == vmin:
+            vmax, vmin = vmax * 1.01 or 1, vmin * 0.99 or 0
+        pad = (vmax - vmin) * 0.08
+        vmin, vmax = vmin - pad, vmax + pad
+        n = len(pts)
+
+        def px(i: int) -> float:
+            return x0 + i * (x1 - x0) / (n - 1)
+
+        def py(v: float) -> float:
+            return y1 - (v - vmin) * (y1 - y0) / (vmax - vmin)
+
+        # grid: 4 horizontal lines with price labels, 3 vertical with dates
+        cr.set_source_rgba(*rgb, 0.18)
+        cr.set_line_width(0.5)
+        for i in range(4):
+            y = y0 + i * (y1 - y0) / 3
+            cr.move_to(x0, y)
+            cr.line_to(x1, y)
+            cr.stroke()
+            _chart_text(cr, x0 - 6 - cr.text_extents(_m_price(vmax - i * (vmax - vmin) / 3)).width,
+                        y + 3, _m_price(vmax - i * (vmax - vmin) / 3), 9, rgb, 0.7)
+        for i in (0, (n - 1) // 2, n - 1):
+            x = px(i)
+            cr.move_to(x, y0)
+            cr.line_to(x, y1)
+            cr.stroke()
+            label = self._date_label(pts[i][0])
+            ext = cr.text_extents(label)
+            tx = x - ext.width / 2 if i == (n - 1) // 2 else (x if i == 0 else x - ext.width)
+            _chart_text(cr, tx, y1 + 12, label, 9, rgb, 0.7)
+
+        # area fill under the line
+        cr.move_to(px(0), y1)
+        for i, (_, v) in enumerate(pts):
+            cr.line_to(px(i), py(v))
+        cr.line_to(px(n - 1), y1)
+        cr.close_path()
+        cr.set_source_rgba(*rgb, 0.08)
+        cr.fill()
+
+        # the line
+        cr.move_to(px(0), py(pts[0][1]))
+        for i, (_, v) in enumerate(pts[1:], 1):
+            cr.line_to(px(i), py(v))
+        cr.set_source_rgba(*rgb, 0.9)
+        cr.set_line_width(1.5)
+        cr.stroke()
+
+        # last point + its price
+        lx, ly = px(n - 1), py(pts[-1][1])
+        cr.arc(lx, ly, 2.5, 0, 2 * 3.14159265)
+        cr.set_source_rgba(*rgb, 1.0)
+        cr.fill()
+        label = _m_price(pts[-1][1])
+        ext = cr.text_extents(label)
+        tx = lx - ext.width - 6 if lx - ext.width - 6 > x0 else lx + 6
+        _chart_text(cr, tx, ly - 6, label, 9, rgb, 1.0, bold=True)
+
+
+class BarChart(Gtk.DrawingArea):
+    """A column chart of a few labeled percentages (the fundamentals
+    margins). set_bars([(label, value), ...]) then queue_draw."""
+
+    def __init__(self, height: int = 150):
+        super().__init__()
+        self.set_size_request(-1, height)
+        self._bars: list[tuple[str, float]] = []
+        self.connect("draw", self._on_draw)
+
+    def set_bars(self, bars: list[tuple[str, float]]):
+        self._bars = list(bars)
+        self.queue_draw()
+
+    def _on_draw(self, _widget, cr):
+        w, h = self.get_allocated_width(), self.get_allocated_height()
+        rgb = _chart_fg(cr, self)
+        _chart_frame(cr, w, h, rgb)
+        if not self._bars:
+            _chart_text(cr, 12, h / 2, "no data for a chart", 10, rgb, 0.6)
+            return
+        top, bottom = 22, 24
+        plot_h = h - top - bottom
+        maxv = max((v for _, v in self._bars), default=0)
+        if maxv <= 0:
+            maxv = 1
+        slot = w / len(self._bars)
+        bar_w = min(slot * 0.5, 64)
+        # baseline
+        cr.set_source_rgba(*rgb, 0.3)
+        cr.set_line_width(0.5)
+        cr.move_to(0, top + plot_h + 0.5)
+        cr.line_to(w, top + plot_h + 0.5)
+        cr.stroke()
+        for i, (label, v) in enumerate(self._bars):
+            cx = slot * i + slot / 2
+            bh = max(0.0, plot_h * v / maxv)
+            x, y = cx - bar_w / 2, top + plot_h - bh
+            cr.set_source_rgba(*rgb, 0.7)
+            cr.rectangle(x, y, bar_w, bh)
+            cr.fill()
+            val = f"{v:.1f}%"
+            ext = cr.text_extents(val)
+            _chart_text(cr, cx - ext.width / 2, y - 6, val, 10, rgb, 1.0, bold=True)
+            ext = cr.text_extents(label)
+            _chart_text(cr, cx - ext.width / 2, h - 13, label, 9, rgb, 0.8)
+
+
 class Worker(threading.Thread):
     """Run a blocking function off the GUI thread and deliver the result (or
     error) back on the main loop via GLib.idle_add. Never call the GUI from
@@ -667,6 +945,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self._x_selected: dict | None = None
         self._r_posts: list[dict] = []
         self._r_selected: dict | None = None
+        self._m_bars: list[dict] = []
+        self._m_coins: list[dict] = []
         self._md_links: dict[Gtk.TextView, list[tuple[int, int, str]]] = {}
 
         self._build_ui()
@@ -718,6 +998,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.tabs.append_page(self._build_history_tab(), Gtk.Label(label="History"))
         self.tabs.append_page(self._build_x_tab(), Gtk.Label(label="X"))
         self.tabs.append_page(self._build_reddit_tab(), Gtk.Label(label="Reddit"))
+        self.tabs.append_page(self._build_markets_tab(), Gtk.Label(label="Markets"))
         self.tabs.set_current_page(0)
         root.pack_start(self.tabs, True, True, 0)
 
@@ -1139,6 +1420,66 @@ class MainWindow(Gtk.ApplicationWindow):
         btn_row.pack_start(self.r_comments_btn, False, False, 0)
         btn_row.pack_start(self.r_profile_btn, False, False, 0)
         btn_row.pack_start(self.r_open_btn, False, False, 0)
+        w.pack_start(btn_row, False, False, 0)
+        return w
+
+    def _build_markets_tab(self) -> Gtk.Widget:
+        """Market data, backed by yfinance (no treg calls, no charges):
+        live stock quotes with a 30-day chart, daily price history, company
+        fundamentals with a margins chart, and crypto (major coins or one
+        coin with its 90-day chart)."""
+        w = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.m_mode = Gtk.ComboBoxText()
+        for label in ("Stock", "History", "Fundamentals", "Crypto"):
+            self.m_mode.append_text(label)
+        self.m_mode.set_active(0)
+        self.m_mode.connect("changed", self._m_mode_changed)
+        self.m_entry = Gtk.Entry()
+        self.m_entry.set_placeholder_text("ticker — e.g. AAPL, MSFT, BRK-B…")
+        self.m_entry.connect("activate", lambda e: self._m_go())
+        self.m_days = Gtk.SpinButton.new_with_range(5, 500, 1)
+        self.m_days.set_value(30)
+        self.m_days.set_size_request(64, -1)
+        self.m_days.set_tooltip_text("days of daily bars")
+        go = Gtk.Button(label="Go")
+        go.connect("clicked", lambda b: self._m_go())
+        row.pack_start(self.m_mode, False, False, 0)
+        row.pack_start(self.m_entry, True, True, 0)
+        row.pack_start(self.m_days, False, False, 0)
+        row.pack_start(go, False, False, 0)
+        w.pack_start(row, False, False, 0)
+
+        paned = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL)
+        self.m_store = Gtk.ListStore(str, str, str, str, str, str)
+        self.m_table = Gtk.TreeView(model=self.m_store)
+        self._m_build_columns()
+        self.m_table.get_selection().connect("changed", lambda s: self._on_m_selected())
+        paned.pack1(self._scrolled(self.m_table), True, True)
+
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.m_chart = PriceChart(height=200)
+        right.pack_start(self.m_chart, False, False, 0)
+        self.m_barchart = BarChart(height=140)
+        self.m_barchart.set_visible(False)
+        right.pack_start(self.m_barchart, False, False, 0)
+        self.m_detail = self._textview()
+        self.m_detail.connect("button-press-event", self._md_link_click)
+        right.pack_start(self._scrolled(self.m_detail), True, True, 0)
+        paned.pack2(right, True, True)
+        paned.set_position(560)
+        w.pack_start(paned, True, True, 0)
+
+        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.m_history_btn = Gtk.Button(label="History")
+        self.m_history_btn.set_tooltip_text("daily bars for the current ticker")
+        self.m_history_btn.connect("clicked", lambda b: self._m_jump("history"))
+        self.m_fundamentals_btn = Gtk.Button(label="Fundamentals")
+        self.m_fundamentals_btn.set_tooltip_text("profile and metrics for the current ticker")
+        self.m_fundamentals_btn.connect("clicked", lambda b: self._m_jump("fundamentals"))
+        btn_row.pack_start(self.m_history_btn, False, False, 0)
+        btn_row.pack_start(self.m_fundamentals_btn, False, False, 0)
         w.pack_start(btn_row, False, False, 0)
         return w
 
@@ -2278,6 +2619,268 @@ class MainWindow(Gtk.ApplicationWindow):
             except GLib.Error as e:
                 self._error(f"could not open {p['url']}: {e.message}")
 
+    # -- Markets tab ---------------------------------------------------------------
+
+    def _m_mode(self) -> str:
+        return _M_MARKET_MODES[self.m_mode.get_active()]
+
+    def _m_mode_changed(self, combo):
+        ph = ("ticker — e.g. AAPL, MSFT, BRK-B…",
+              "ticker for daily bars — e.g. AAPL",
+              "ticker for profile and metrics — e.g. AAPL",
+              "coin — BTC, ETH… (blank = major coins)")[combo.get_active()]
+        self.m_entry.set_placeholder_text(ph)
+        self.m_days.set_sensitive(combo.get_active() == 1)
+        self.m_store.clear()
+        self._m_build_columns()
+        self.m_chart.set_data([], [])
+        self.m_barchart.set_bars([])
+        self.m_detail.get_buffer().set_text("")
+        self._m_sync_visibility()
+
+    def _m_build_columns(self):
+        for c in list(self.m_table.get_columns()):
+            self.m_table.remove_column(c)
+        headers = {
+            "stock": ("Field", "Value"),
+            "history": ("Date", "Open", "High", "Low", "Close", "Volume"),
+            "fundamentals": ("Metric", "Value"),
+            "crypto": ("Coin", "Price", "24h", "7d", "Volume"),
+        }[self._m_mode()]
+        for i, h in enumerate(headers):
+            self.m_table.append_column(
+                Gtk.TreeViewColumn(h, Gtk.CellRendererText(), text=i))
+
+    def _m_sync_visibility(self):
+        fund = self._m_mode() == "fundamentals"
+        self.m_barchart.set_visible(fund)
+        self.m_chart.set_visible(not fund)
+
+    def _m_jump(self, mode: str):
+        self.m_mode.set_active(_M_MARKET_MODES.index(mode))
+        self._m_go()
+
+    def _m_go(self):
+        mode = self._m_mode()
+        q = self.m_entry.get_text().strip()
+        if mode in ("stock", "history", "fundamentals"):
+            q = q.upper()
+            if not q:
+                return
+        if mode == "stock":
+            self._busy(f"Quote for {q}…")
+            self._spawn(_m_quote_worker, q,
+                        on_ok=self._m_quote_done,
+                        on_fail=lambda m: self._error(f"quote: {m}"))
+        elif mode == "history":
+            days = int(self.m_days.get_value())
+            self._busy(f"Daily bars for {q} ({days} days)…")
+            self._spawn(_m_history_worker, q, days,
+                        on_ok=self._m_history_done,
+                        on_fail=lambda m: self._error(f"bars: {m}"))
+        elif mode == "fundamentals":
+            self._busy(f"Fundamentals for {q}…")
+            self._spawn(_m_fundamentals_worker, q,
+                        on_ok=self._m_fundamentals_done,
+                        on_fail=lambda m: self._error(f"fundamentals: {m}"))
+        elif not q:
+            self._busy("Major coins — latest prices…")
+            self._spawn(_m_coins_worker,
+                        on_ok=self._m_coins_done,
+                        on_fail=lambda m: self._error(f"coins: {m}"))
+        else:
+            self._busy(f"Coin {q}…")
+            self._spawn(_m_coin_worker, q,
+                        on_ok=self._m_coin_done,
+                        on_fail=lambda m: self._error(f"coin: {m}"))
+
+    def _m_status(self, n: int, noun: str):
+        self._busy(f"{n} {noun} · via yfinance (direct, free)")
+
+    def _m_fill_quote(self, q: dict):
+        self.m_store.clear()
+        rows = [
+            ("Price", _m_price(q.get("price"))),
+            ("Change (24h)", f"{_m_price(q['change'])} ({_m_pct(q['change_pct'])})"
+             if q.get("change") is not None and q.get("change_pct") is not None else "—"),
+            ("Open", _m_price(q.get("open"))),
+            ("Day high", _m_price(q.get("day_high"))),
+            ("Day low", _m_price(q.get("day_low"))),
+            ("Previous close", _m_price(q.get("previous_close"))),
+            ("Volume", _count(q["volume"]) if q.get("volume") is not None else "—"),
+            ("Market cap", _m_big(q.get("market_cap"))),
+            ("52-week high", _m_price(q.get("year_high"))),
+            ("52-week low", _m_price(q.get("year_low"))),
+            ("50-day avg", _m_price(q.get("fifty_day_avg"))),
+            ("200-day avg", _m_price(q.get("two_hundred_day_avg"))),
+        ]
+        for k, v in rows:
+            if v != "—":
+                self.m_store.append([k, v, "", "", "", ""])
+
+    def _m_quote_done(self, out: dict):
+        q = out["quote"]
+        self._m_fill_quote(q)
+        self.m_chart.set_data([b["date"] for b in out["bars"]],
+                               [b["close"] for b in out["bars"]])
+        self._m_sync_visibility()
+        sym = q.get("symbol") or self.m_entry.get_text().strip()
+        lines = [f"**{sym}**", ""]
+        bits = [b for b in (q.get("quote_type"), q.get("exchange"),
+                            q.get("currency")) if b]
+        if bits:
+            lines.append(" · ".join(_esc(b) for b in bits))
+            lines.append("")
+        lines += ["**30-day close** — chart above",
+                  "", f"[Open on Yahoo Finance](https://finance.yahoo.com/quote/{sym})"]
+        self._render_md(self.m_detail, "\n".join(lines))
+        self._m_status(1, "quote")
+
+    def _m_history_done(self, bars: list):
+        self._m_bars = bars
+        self.m_store.clear()
+        for b in bars:
+            self.m_store.append([b["date"], _m_price(b["open"]), _m_price(b["high"]),
+                                 _m_price(b["low"]), _m_price(b["close"]),
+                                 _count(b["volume"]) if b["volume"] is not None else "—"])
+        self.m_chart.set_data([b["date"] for b in bars],
+                               [b["close"] for b in bars])
+        self._m_sync_visibility()
+        self._m_history_detail(None)
+        self._m_status(len(bars), "bars")
+
+    def _m_history_detail(self, b: dict | None):
+        bars = self._m_bars
+        sym = self.m_entry.get_text().strip()
+        lines = [f"**{sym}** — {len(bars)} daily bars", ""]
+        closes = [x["close"] for x in bars if x["close"] is not None]
+        if len(closes) >= 2:
+            first, last = closes[0], closes[-1]
+            lines.append(f"Close {bars[0]['date']} → {bars[-1]['date']}: "
+                         f"{_m_price(first)} → {_m_price(last)}  "
+                         f"(**{(last - first) / first * 100:+.1f}%**)")
+        highs = [x["high"] for x in bars if x["high"] is not None]
+        lows = [x["low"] for x in bars if x["low"] is not None]
+        vols = [x["volume"] for x in bars if x["volume"] is not None]
+        bits = []
+        if highs:
+            bits.append(f"Period high: {_m_price(max(highs))}")
+        if lows:
+            bits.append(f"Period low: {_m_price(min(lows))}")
+        if vols:
+            bits.append(f"Avg volume: {_count(sum(vols) / len(vols))}")
+        if bits:
+            lines.append("  ·  ".join(bits))
+        if b:
+            lines += ["", "**Selected**",
+                      f"{b['date']}  ·  O {_m_price(b['open'])}  ·  H {_m_price(b['high'])}  "
+                      f"·  L {_m_price(b['low'])}  ·  C {_m_price(b['close'])}  ·  "
+                      f"Vol {_count(b['volume']) if b['volume'] is not None else '—'}"]
+        lines += ["", f"[Open on Yahoo Finance](https://finance.yahoo.com/quote/{sym})"]
+        self._render_md(self.m_detail, "\n".join(lines))
+
+    def _m_fundamentals_done(self, met: dict):
+        sym = self.m_entry.get_text().strip()
+        self.m_store.clear()
+        rows = [
+            ("P/E (trailing)", _m_ratio(met.get("trailing_pe"))),
+            ("P/E (forward)", _m_ratio(met.get("forward_pe"))),
+            ("EPS (ttm)", _m_ratio(met.get("eps"))),
+            ("Revenue", _m_big(met.get("revenue"))),
+            ("Revenue growth", _m_pct(met["revenue_growth"] * 100)
+             if met.get("revenue_growth") is not None else "—"),
+            ("Gross margin", _m_frac(met.get("gross_margin"))),
+            ("Operating margin", _m_frac(met.get("operating_margin"))),
+            ("Profit margin", _m_frac(met.get("profit_margin"))),
+            ("ROE", _m_frac(met.get("roe"))),
+            ("Debt / equity", _m_ratio(met.get("debt_to_equity"))),
+            ("Dividend yield", _m_frac(met.get("dividend_yield"))),
+            ("Beta", _m_ratio(met.get("beta"))),
+            ("52-week change", _m_pct(met.get("week52_change"))),
+            ("Employees", _count(met["employees"])
+             if met.get("employees") is not None else "—"),
+        ]
+        for k, v in rows:
+            if v != "—":
+                self.m_store.append([k, v, "", "", "", ""])
+        bars = [(label, met[key] * 100) for label, key in
+                (("Gross margin", "gross_margin"),
+                 ("Operating margin", "operating_margin"),
+                 ("Profit margin", "profit_margin"))
+                if met.get(key) is not None]
+        self.m_barchart.set_bars(bars)
+        self._m_sync_visibility()
+        name = met.get("name") or sym
+        lines = [f"**{_esc(name)}**  ({sym})", ""]
+        bits = [b for b in (met.get("sector"), met.get("industry"),
+                            met.get("country")) if b]
+        if bits:
+            lines.append("  ·  ".join(_esc(b) for b in bits))
+            lines.append("")
+        if met.get("market_cap") is not None:
+            lines.append(f"Market cap: {_m_big(met['market_cap'])}")
+            lines.append("")
+        if met.get("website"):
+            lines += [f"[{met['website']}]({met['website']})", ""]
+        lines += ["**Margins** — chart above, full metrics in the table",
+                  "", f"[Open on Yahoo Finance](https://finance.yahoo.com/quote/{sym})"]
+        self._render_md(self.m_detail, "\n".join(lines))
+        self._m_status(1, "profile")
+
+    def _m_coins_done(self, rows: list):
+        self._m_coins = rows
+        self.m_store.clear()
+        for c in rows:
+            self.m_store.append([c["name"], _m_price(c["price"]),
+                                 _m_pct(c["change_24h"]), _m_pct(c["change_7d"]),
+                                 _count(c["volume"]) if c["volume"] is not None else "—", ""])
+        self.m_chart.set_data([], [])
+        self.m_chart.set_visible(False)  # the list has no series to chart
+        self._render_md(self.m_detail,
+                        "**Major coins** — latest prices (one batched Yahoo call).\n\n"
+                        "Select a coin for its 90-day chart.")
+        self._m_status(len(rows), "coins")
+
+    def _m_coin_done(self, out: dict):
+        q = out["quote"]
+        name = out.get("name") or q["symbol"]
+        self._m_coins = []
+        self.m_store.clear()
+        self.m_store.append([name, _m_price(q["price"]),
+                             _m_pct(q["change_pct"]), "",
+                             _count(q["volume"]) if q.get("volume") is not None else "—", ""])
+        self.m_chart.set_data([b["date"] for b in out["bars"]],
+                               [b["close"] for b in out["bars"]])
+        self._m_sync_visibility()
+        lines = [f"**{name}**", ""]
+        bits = [f"{_m_price(q['price'])}  ·  {_m_pct(q.get('change_pct'))} (24h)"]
+        if q.get("market_cap") is not None:
+            bits.append(f"Market cap: {_m_big(q['market_cap'])}")
+        if q.get("year_high") is not None and q.get("year_low") is not None:
+            bits.append(f"52-week: {_m_price(q['year_low'])} – {_m_price(q['year_high'])}")
+        lines.append("  ·  ".join(bits))
+        lines += ["", "**90-day close** — chart above",
+                  "", f"[Open on Yahoo Finance](https://finance.yahoo.com/quote/{q['symbol']})"]
+        self._render_md(self.m_detail, "\n".join(lines))
+        self._m_status(1, "coin")
+
+    def _on_m_selected(self):
+        model, treeiter = self.m_table.get_selection().get_selected()
+        if treeiter is None:
+            return
+        idx = model.get_path(treeiter).get_indices()[0]
+        mode = self._m_mode()
+        if mode == "history" and idx < len(self._m_bars):
+            self._m_history_detail(self._m_bars[idx])
+        elif mode == "crypto" and idx < len(self._m_coins):
+            self._m_load_coin(self._m_coins[idx])
+
+    def _m_load_coin(self, row: dict):
+        self._busy(f"90-day chart for {row['name']}…")
+        self._spawn(_m_coin_worker, row["symbol"],
+                    on_ok=self._m_coin_done,
+                    on_fail=lambda m: self._error(f"coin: {m}"))
+
     # -- shutdown --------------------------------------------------------------------
 
     def _on_destroy(self, window):
@@ -2296,7 +2899,9 @@ def _activate(app: Gtk.Application, auto_desktop: bool):
         return
     if auto_desktop:
         install_desktop_entry()
-    MainWindow(application=app).show_all()
+    win = MainWindow(application=app)
+    win.show_all()  # re-shows everything, so re-apply the Markets mode visibility
+    win._m_sync_visibility()
 
 
 def main(argv: list[str] | None = None) -> int:

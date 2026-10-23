@@ -17,6 +17,7 @@ install_data(
   'treg_console/__main__.py',
   'treg_console/app.py',
   'treg_console/client.py',
+  'treg_console/markets.py',
   'treg_console/desktop.py',
   'treg_console/icon.png',
   install_dir: pkgdir,

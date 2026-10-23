@@ -19,4 +19,5 @@ classifiers = [
 dependencies = [
   "PyGObject>=3.40",
   "httpx>=0.27",
+  "yfinance>=0.2",
 ]

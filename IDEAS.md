@@ -12,6 +12,8 @@ catalog already has coverage it's noted; the rest is to build.
   laid out. treg has a Stock Market Data platform (57 endpoints) and Crypto
   Market Data (14). **yfinance** as a direct data source where the catalog
   doesn't reach.
+  *Done — the Markets tab is in the app, backed by yfinance (free, direct)
+  with price and margin charts (see README).*
 - **News** — search and aggregate news, then sort it out: dedupe, rank, and
   summarize with the local model.
 - **AI over all of it (MCP)** — an AI that can look at all of the above:

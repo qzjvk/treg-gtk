@@ -27,6 +27,8 @@ desktop environment shows the right icon and groups the window with the app.
 
 - Python 3.10+ with `PyGObject` (`python3-gi` on Debian/Devuan) and `httpx`
 - GTK 3 (system libraries)
+- `yfinance` for the Markets tab (Yahoo Finance data, free; the other tabs
+  work without it)
 - meson ≥ 1.8 and ninja (for installing)
 - a treg login: `treg login` (writes `~/.treg/config.json`), or `TREG_TOKEN`
 
@@ -127,6 +129,18 @@ treg-console --no-desktop           # start without touching it
   data stays on screen. Posts come from treg-routed Reddit endpoints —
   each view costs a fraction of a cent, and the charge shows in the status
   bar.
+- **Markets** — market data backed by **yfinance** (Yahoo Finance, direct
+  and free — no treg calls, no charges, works without a treg token). Four
+  modes: **Stock** (a live quote — price, change, day range, volume, market
+  cap, 52-week range, moving averages — with a 30-day close chart),
+  **History** (daily OHLCV bars for any number of days, with a period chart
+  and summary; selecting a bar shows its detail), **Fundamentals** (company
+  profile — sector, industry, market cap, website — plus P/E, EPS, revenue,
+  margins, ROE, debt/equity, dividend yield and beta, with the margins as a
+  bar chart), and **Crypto** (major coins' latest prices in one batched
+  call; select a coin, or enter a ticker or name, for its quote and
+  90-day chart). Charts are plain Cairo in the theme's colors — no chart
+  library.
 
 ## Credentials
 
@@ -140,8 +154,9 @@ meson.build            meson project (package, command, .desktop, icon)
 pyproject.toml         meson-python build config (pip install .)
 data/                  .desktop entry + launcher script
 treg_console/
-  app.py               the GUI (tabs, worker threads, async polling)
+  app.py               the GUI (tabs, worker threads, async polling, charts)
   client.py            synchronous REST client for the treg API
+  markets.py           yfinance data source for the Markets tab (free, direct)
   desktop.py           .desktop + icon installation (user XDG dirs)
   icon.png             app icon
 ```
