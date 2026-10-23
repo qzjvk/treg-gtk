@@ -51,6 +51,10 @@ arrives as a tab plus its AI tools.
   open a repo, look up a ticker, or ask the AI.
   *Done — the **Ctrl+K** palette is in the app, with an **Ask AI** action for
   arbitrary text (see README).*
+- **Tab shortcuts** — Alt+1…Alt+9, Alt+0 (and Alt+Shift+1/2 for the last two)
+  switch tabs from anywhere, including while typing.
+  *Done — wired into the window with unshifted-keyval matching so Shift+digit
+  works on any layout; tab tooltips and the palette list the shortcut.*
 - **Streaming answers + Stop** — stream the local model's tokens into the AI
   tab and make a turn cancellable. *(Open — still non-streaming.)*
 - **Persistent chats + model picker** — save/reopen conversations and choose

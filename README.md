@@ -231,6 +231,10 @@ treg-console --no-desktop           # start without touching it
   web/catalog/news/Hacker News/GitHub, open a repo by `owner/name`, look up a
   ticker, or **Ask AI** the query. Arrow keys move, Enter runs, Escape closes.
   It is also a **Search / ask** button in the top bar.
+- **Alt+1 … Alt+0** — switch tabs from anywhere, including while typing in a
+  search field: Alt+1–9 for the first nine tabs, Alt+0 for the tenth (News),
+  and Alt+Shift+1/2 for Hacker News and GitHub. Each tab's tooltip shows its
+  shortcut, and the palette lists it too.
 
 Every tab carries at least one AI action — that is the app's doctrine; see
 **Doctrine — how features are added**.

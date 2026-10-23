@@ -1,6 +1,6 @@
 project(
   'treg-console',
-  version: '1.4.0',
+  version: '1.4.1',
   license: 'MIT',
   meson_version: '>=1.8.0',
 )

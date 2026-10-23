@@ -35,6 +35,8 @@ Tabs:
              Ask AI / AI digest
   Ctrl+K   — a command palette that jumps to any tab, searches a source, or
              hands the query to the AI
+  Alt+<n>  — switch tabs from anywhere: Alt+1…Alt+9, Alt+0 for the tenth,
+             then Alt+Shift+1… for later tabs
 
 Credentials come from the treg CLI config (~/.treg/config.json) or TREG_TOKEN.
 The AI endpoint is OpenAI-compatible; configure it with AI_URL, AI_API_KEY
@@ -651,24 +653,44 @@ class MainWindow(Gtk.ApplicationWindow):
         root.pack_start(top, False, False, 0)
 
         self.tabs = Gtk.Notebook()
-        self.tabs.append_page(self._build_browse_tab(), Gtk.Label(label="Browse"))
-        self.tabs.append_page(self._build_ai_tab(), Gtk.Label(label="AI"))
-        self.tabs.append_page(self._build_catalog_tab(), Gtk.Label(label="Catalog"))
-        self.tabs.append_page(self._build_providers_tab(), Gtk.Label(label="Providers"))
-        self.tabs.append_page(self._build_call_tab(), Gtk.Label(label="Call"))
-        self.tabs.append_page(self._build_history_tab(), Gtk.Label(label="History"))
-        self.tabs.append_page(self._build_x_tab(), Gtk.Label(label="X"))
-        self.tabs.append_page(self._build_reddit_tab(), Gtk.Label(label="Reddit"))
-        self.tabs.append_page(self._build_markets_tab(), Gtk.Label(label="Markets"))
-        self.tabs.append_page(self._build_news_tab(), Gtk.Label(label="News"))
-        self.tabs.append_page(self._build_hn_tab(), Gtk.Label(label="Hacker News"))
-        self.tabs.append_page(self._build_gh_tab(), Gtk.Label(label="GitHub"))
+        self.tabs.set_tooltip_text(
+            "Switch tabs with Alt+1…Alt+0 (Alt+Shift+1… for the last tabs)")
+        self._add_tab(self._build_browse_tab(), "Browse")
+        self._add_tab(self._build_ai_tab(), "AI")
+        self._add_tab(self._build_catalog_tab(), "Catalog")
+        self._add_tab(self._build_providers_tab(), "Providers")
+        self._add_tab(self._build_call_tab(), "Call")
+        self._add_tab(self._build_history_tab(), "History")
+        self._add_tab(self._build_x_tab(), "X")
+        self._add_tab(self._build_reddit_tab(), "Reddit")
+        self._add_tab(self._build_markets_tab(), "Markets")
+        self._add_tab(self._build_news_tab(), "News")
+        self._add_tab(self._build_hn_tab(), "Hacker News")
+        self._add_tab(self._build_gh_tab(), "GitHub")
         self.tabs.set_current_page(0)
         root.pack_start(self.tabs, True, True, 0)
 
         self.statusbar = Gtk.Statusbar()
         self._status_ctx = self.statusbar.get_context_id("main")
         root.pack_start(self.statusbar, False, False, 0)
+
+    def _add_tab(self, widget: Gtk.Widget, label: str) -> None:
+        """Append a tab whose label advertises its Alt+<n> shortcut."""
+        tab_label = Gtk.Label(label=label)
+        shortcut = self._tab_shortcut(self.tabs.get_n_pages())
+        if shortcut:
+            tab_label.set_tooltip_text(f"{label} — {shortcut}")
+        self.tabs.append_page(widget, tab_label)
+
+    @staticmethod
+    def _tab_shortcut(index: int) -> str:
+        """The keyboard shortcut for a tab index: Alt+1…Alt+9, Alt+0, then
+        Alt+Shift+1… for the tabs after the tenth."""
+        if index < 0:
+            return ""
+        if index < 10:
+            return f"Alt+{(index + 1) % 10}"
+        return f"Alt+Shift+{(index - 10 + 1) % 10}"
 
     @staticmethod
     def _scrolled(widget, max_height: int | None = None) -> Gtk.ScrolledWindow:
@@ -3655,8 +3677,9 @@ class MainWindow(Gtk.ApplicationWindow):
     def _palette_static(self) -> list[tuple[str, str, str, object]]:
         labels = [self.tabs.get_tab_label_text(self.tabs.get_nth_page(i))
                   for i in range(self.tabs.get_n_pages())]
-        rows = [(f"Go to {label}", f"switch to the {label} tab", "tab", i)
-                for i, label in enumerate(labels)]
+        rows = [(f"Go to {label}",
+                 f"switch to the {label} tab ({self._tab_shortcut(i)})",
+                 "tab", i) for i, label in enumerate(labels)]
         rows += [
             ("New AI chat", "clear the conversation", "ai_new", None),
             ("Refresh team and balance",
@@ -3711,9 +3734,53 @@ class MainWindow(Gtk.ApplicationWindow):
                 and event.keyval in (Gdk.KEY_k, Gdk.KEY_K)):
             self._open_palette()
             return True
+        # Alt+<n> switches tabs, but leave Ctrl+Alt+<n> and Super+Alt+<n>
+        # alone for the desktop environment.
+        blocked = Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SUPER_MASK
+        if event.state & Gdk.ModifierType.MOD1_MASK and not (event.state & blocked):
+            index = self._alt_tab_index(event)
+            if index is not None:
+                if 0 <= index < self.tabs.get_n_pages():
+                    self.tabs.set_current_page(index)
+                return True
         return False
 
+    @staticmethod
+    def _digit_order() -> list[int]:
+        # The digit row's unshifted keyvals in tab order: 1…9, 0.
+        return [getattr(Gdk, f"KEY_{n}") for n in range(1, 10)] + [Gdk.KEY_0]
+
+    def _alt_tab_index(self, event) -> int | None:
+        """Alt+1…Alt+9, Alt+0 → tabs 0…9; Alt+Shift+1… → tabs 10, 11, …
+        Uses the unshifted keyval so Shift+1 (which arrives as '!') still
+        maps to tab ten."""
+        base = self._base_keyval(event)
+        order = self._digit_order()
+        if base not in order:
+            return None
+        index = order.index(base)
+        if event.state & Gdk.ModifierType.SHIFT_MASK:
+            index += 10
+        return index
+
+    def _base_keyval(self, event) -> int:
+        """The unshifted keyval of a key event (Shift+1 → 1)."""
+        try:
+            keymap = Gdk.Keymap.get_for_display(self.get_display())
+            ok, keyval, _group, _level, _consumed = \
+                keymap.translate_keyboard_state(
+                    event.hardware_keycode, 0, event.group)
+            if ok:
+                return keyval
+        except (AttributeError, TypeError, GLib.Error):
+            pass
+        return event.keyval
+
     def _palette_key(self, entry, event) -> bool:
+        if event.state & Gdk.ModifierType.MOD1_MASK:
+            if self._on_window_key(self, event):
+                self._palette.hide()
+                return True
         if event.keyval == Gdk.KEY_Escape:
             self._palette.hide()
             return True
